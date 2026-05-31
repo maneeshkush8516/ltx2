@@ -2,7 +2,7 @@
   "id": "FEAT-001",
   "type": "refactor",
   "description": "Code Architecture improvements: Add dataclasses (LoRAConfig, ClipResult), split generate_clip() into composable sub-functions, extract _generate_single_segment() shared method, add node instance reuse at module level, and wrap Cell 5 _run() call in explicit trigger pattern.",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "1. At the top of Cell 3 (after imports), add dataclass imports and define: LoRAConfig dataclass with fields (on: bool, lora: str, guard: bool, strength: float) to replace the dict-based LD_LORA_STACK entries; ClipResult dataclass with fields (path: str, last_frame: Optional[torch.Tensor], duration: float, seed: int) as return type from generate_clip.",
     "2. Replace the global LD_LORA_STACK list-of-dicts with a list of LoRAConfig instances. Update _apply_loras() to accept List[LoRAConfig] as parameter instead of reading global. Update _LORA_STACK_JSON computation to serialize from LoRAConfig instances. Keep backward compatibility by accepting the LoRAConfig list parameter with a default that mirrors current behavior.",
@@ -25,5 +25,5 @@
     "python -c \"import ast; tree=ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); names=[n.name for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef))]; assert 'LoRAConfig' in names; assert 'ClipResult' in names; assert '_generate_single_segment' in names; assert '_load_clip_encode' in names; assert '_pass1' in names; assert '_pass2' in names; print('All structures present')\""
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "All 6 steps implemented successfully. generate_clip now returns ClipResult. _pass2 signature simplified by removing unused vae_a parameter. VAE models are loaded once and shared across sub-functions without reloading. _generate_single_segment extracts the OOM retry pattern used by both scene_chain and temporal_extend modes."
 }

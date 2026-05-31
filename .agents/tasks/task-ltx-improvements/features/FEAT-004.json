@@ -1,0 +1,27 @@
+{
+  "id": "FEAT-004",
+  "type": "feat",
+  "description": "Character Consistency improvements: Bible drift detection, structured bible parsing, multi-character support, and latent-space anchor blending option.",
+  "status": "in_progress",
+  "steps": [
+    "1. Bible drift detection: Add a method validate_bible(self, current_frame: torch.Tensor, vision_engine: VisionDescribeEngine) -> dict to CharacterBible that runs VisionDescribe on the current frame, compares key attributes (hair color, skin tone, clothing) against stored bible entries, and returns a drift report dict with {character_name: {attribute: (expected, observed, drifted: bool)}}. Add a drift_check_interval: int = 3 param to InfiniteFlowEngine. In _run_scene_chain/_run_temporal_extend, every drift_check_interval beats, call bible.validate_bible() and log warnings if drift detected.",
+    "2. Structured bible parsing: Add a method parse_structured(self, name: str, description: str) -> dict to CharacterBible that uses regex patterns to extract structured fields from VisionDescribe output: age (regex for numbers near 'year' or 'old'), hair_color (regex for color words near 'hair'), skin_tone (regex for ethnicity/skin descriptors), clothing (sentences containing clothing keywords), build (body type keywords). Store both _raw and _structured in the character entry. Update to_prompt_block() to emit structured fields when available.",
+    "3. Multi-character support: Update VisionDescribeEngine with a describe_characters(image) -> List[dict] method that detects multiple people in the image. Modify the PROMPT to ask 'If multiple people are visible, describe each person separately with a numbered list.' Add post-processing in describe_characters() that splits the output on numbered patterns and creates separate entries. Update InfiniteFlowEngine seed image processing to call describe_characters() and populate bible with multiple entries.",
+    "4. Latent-space anchor blending: Add an alternative to the current pixel-space blending in generate_clip(). Add a parameter blend_mode: str = 'pixel' (options: 'pixel', 'latent_slerp'). When 'latent_slerp' is selected and anchor_image is provided, instead of blending in pixel space, encode both images through VAE to get latent representations, perform spherical linear interpolation (slerp) between them using anchor_weight, then use the interpolated latent as conditioning. Add a _slerp(t, v0, v1) helper function for the interpolation."
+  ],
+  "acceptance_criteria": [
+    "AST parse passes",
+    "CharacterBible has validate_bible() method",
+    "CharacterBible has parse_structured() method with regex extraction",
+    "VisionDescribeEngine has describe_characters() method",
+    "generate_clip() has blend_mode parameter",
+    "_slerp() helper function exists",
+    "InfiniteFlowEngine has drift_check_interval param"
+  ],
+  "verification": [
+    "python -c \"import ast; ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); print('PASS')\"",
+    "python -c \"import ast; tree=ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); names=[n.name for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef))]; assert 'validate_bible' in names; assert 'parse_structured' in names; assert 'describe_characters' in names; assert '_slerp' in names; print('Character consistency features present')\""
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

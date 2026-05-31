@@ -810,6 +810,117 @@ class VisionDescribeEngine:
         print(f"   [VisionDescribe] Done  {len(desc.split())} words.")
         return desc
 
+    def describe_characters(self, image: Union[Image.Image, torch.Tensor]) -> List[dict]:
+        """Detect multiple people in the image and return separate character entries.
+
+        Uses a modified prompt asking for numbered descriptions of each person.
+        Post-processes the output to split on numbered patterns.
+
+        Args:
+            image: PIL Image or torch Tensor of the image to analyse.
+
+        Returns:
+            List of dicts, each with 'index' and 'description' keys.
+            If only one person (or none), returns a single-entry list.
+        """
+        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+        from huggingface_hub import snapshot_download
+        try:
+            from qwen_vl_utils import process_vision_info
+        except ImportError:
+            raise ImportError("[VisionDescribe] pip install qwen-vl-utils")
+
+        if isinstance(image, torch.Tensor):
+            image = tensor_to_pil(image)
+
+        # Reuse loaded model if keep_loaded and already loaded
+        if self.keep_loaded and self._model is not None and self._processor is not None:
+            model = self._model
+            processor = self._processor
+        else:
+            hf_id = self.MODEL_OPTIONS[self.model_key]
+            if not self.offline:
+                os.environ.pop("TRANSFORMERS_OFFLINE", None)
+                try:
+                    source = snapshot_download(hf_id)
+                except Exception:
+                    source = hf_id
+            else:
+                os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                source = hf_id
+
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            print(f"   [VisionDescribe] Loading {self.model_key} for multi-character detection...")
+            processor = AutoProcessor.from_pretrained(source, local_files_only=self.offline)
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                source, device_map="auto", torch_dtype=dtype,
+                local_files_only=self.offline)
+            model.eval()
+
+        multi_prompt = (
+            "Describe all people visible in this image. "
+            "If multiple people are visible, describe each person separately "
+            "with a numbered list (1. 2. 3. etc). "
+            "For each person include: ethnicity and skin tone, age, hair colour and style, "
+            "body type, clothing or nude state, pose. "
+            "If only one person is visible, just describe them in one paragraph. "
+            "If no people are visible, say 'No people detected'."
+        )
+
+        messages = [
+            {"role": "system", "content":
+             "You are an image analysis tool. Describe exactly what you see."},
+            {"role": "user", "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": multi_prompt},
+            ]},
+        ]
+        text_in = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        img_in, vid_in = process_vision_info(messages)
+        inputs = processor(text=[text_in], images=img_in, videos=vid_in,
+                           padding=True, return_tensors="pt").to(model.device)
+        input_len = inputs["input_ids"].shape[1]
+
+        tok = processor.tokenizer
+        stop_ids = [i for i in [tok.eos_token_id] if i is not None]
+        for s in ["<|im_end|>", "<|endoftext|>"]:
+            ids = tok.encode(s, add_special_tokens=False)
+            if len(ids) == 1 and ids[0] not in stop_ids:
+                stop_ids.append(ids[0])
+
+        with torch.no_grad():
+            out = model.generate(**inputs, max_new_tokens=400, temperature=0.3,
+                                 do_sample=True, top_p=0.9,
+                                 pad_token_id=tok.pad_token_id or tok.eos_token_id,
+                                 eos_token_id=stop_ids)
+        raw_output = tok.decode(out[0][input_len:], skip_special_tokens=True).strip()
+        del out, inputs
+
+        if self.keep_loaded:
+            self._model = model
+            self._processor = processor
+        else:
+            del model, processor
+            self._model = None
+            self._processor = None
+            _vram_free()
+
+        # Post-process: split on numbered patterns (1. 2. 3. etc)
+        entries = re.split(r'\n?\s*\d+\.\s+', raw_output)
+        # First split element is often empty or preamble before "1."
+        entries = [e.strip() for e in entries if e.strip()]
+
+        if not entries:
+            entries = [raw_output.strip()]
+
+        results = []
+        for idx, entry in enumerate(entries, 1):
+            results.append({"index": idx, "description": entry})
+
+        print(f"   [VisionDescribe] Multi-character: detected {len(results)} character(s).")
+        return results
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # SECTION B  --  EASY PROMPT ENGINE
@@ -1103,13 +1214,110 @@ class CharacterBible:
         """Store a raw Vision Describe output under a character name."""
         self._chars[name] = {"_raw": description.strip()}
 
+    def parse_structured(self, name: str, description: str) -> dict:
+        """Extract structured fields from a VisionDescribe output using regex.
+
+        Extracts: age, hair_color, skin_tone, clothing, build.
+        Stores both _raw and _structured in the character entry.
+
+        Returns:
+            dict with extracted fields (may be partially empty).
+        """
+        text = description.strip()
+        structured = {}
+
+        # Age: look for numbers near 'year' or 'old' or standalone age patterns
+        age_match = re.search(r'(\d{1,3})\s*[-\s]?\s*(?:year|yr)s?\s*(?:old)?', text, re.I)
+        if not age_match:
+            age_match = re.search(r'(?:age[d]?\s*|around\s+|about\s+)(\d{1,3})', text, re.I)
+        if age_match:
+            structured["age"] = age_match.group(1)
+
+        # Hair color: color words near 'hair'
+        hair_match = re.search(
+            r'(blonde|brunette|black|brown|red|auburn|grey|gray|white|silver|dark|light|'
+            r'platinum|golden|ginger|sandy|chestnut|raven)\s+hair',
+            text, re.I)
+        if not hair_match:
+            hair_match = re.search(
+                r'hair\s+(?:is\s+|that\s+is\s+)?'
+                r'(blonde|brunette|black|brown|red|auburn|grey|gray|white|silver|dark|light|'
+                r'platinum|golden|ginger|sandy|chestnut|raven)',
+                text, re.I)
+        if hair_match:
+            structured["hair_color"] = hair_match.group(1).lower()
+
+        # Skin tone: ethnicity or skin descriptors
+        skin_match = re.search(
+            r'((?:light|dark|medium|olive|fair|pale|tan|deep|warm|cool)[\s-]*skin(?:ned)?|'
+            r'(?:Black|white|South Asian|East Asian|Latino|Latina|Hispanic|Middle Eastern|'
+            r'African|Caucasian|Asian|Indigenous|Pacific Islander)\s+(?:man|woman|person|male|female))',
+            text)
+        if not skin_match:
+            skin_match = re.search(
+                r'(?:skin\s+(?:tone|color|colour)\s+(?:is\s+)?)'
+                r'(light|dark|medium|olive|fair|pale|tan|deep|warm|cool)',
+                text, re.I)
+        if skin_match:
+            structured["skin_tone"] = skin_match.group(1).strip()
+
+        # Clothing: sentences containing clothing keywords
+        clothing_keywords = [
+            'wearing', 'dressed', 'shirt', 'pants', 'dress', 'jacket', 'coat',
+            'suit', 'blouse', 'skirt', 'jeans', 'shorts', 'hoodie', 'sweater',
+            'top', 'outfit', 'uniform', 'gown', 'robe', 'vest', 'hat', 'shoes',
+            'boots', 'sneakers', 'nude', 'naked', 'bikini', 'swimsuit', 'tank',
+        ]
+        sentences = re.split(r'[.!?]+', text)
+        clothing_parts = []
+        for s in sentences:
+            s_lower = s.lower()
+            if any(kw in s_lower for kw in clothing_keywords):
+                clothing_parts.append(s.strip())
+        if clothing_parts:
+            structured["clothing"] = ". ".join(clothing_parts)
+
+        # Build: body type keywords
+        build_match = re.search(
+            r'(slim|slender|athletic|muscular|stocky|heavyset|petite|tall|short|'
+            r'thin|curvy|average|lean|broad|large|small|fit|toned|plump|robust)',
+            text, re.I)
+        if build_match:
+            structured["build"] = build_match.group(1).lower()
+
+        # Store both raw and structured
+        self._chars[name] = {"_raw": text, "_structured": structured}
+        return structured
+
     def to_prompt_block(self) -> str:
         """Returns the injection string for EasyPromptEngine."""
         if not self._chars:
             return ""
         lines = []
         for name, attrs in self._chars.items():
-            if "_raw" in attrs:
+            if "_structured" in attrs and attrs["_structured"]:
+                # Prefer structured fields for precision
+                parts = []
+                s = attrs["_structured"]
+                if "age" in s:
+                    parts.append(f"age: {s['age']}")
+                if "hair_color" in s:
+                    parts.append(f"hair: {s['hair_color']}")
+                if "skin_tone" in s:
+                    parts.append(f"skin: {s['skin_tone']}")
+                if "build" in s:
+                    parts.append(f"build: {s['build']}")
+                if "clothing" in s:
+                    parts.append(f"clothing: {s['clothing']}")
+                structured_str = "; ".join(parts)
+                # Include raw description as fallback context
+                raw = attrs.get("_raw", "")
+                if raw:
+                    lines.append(
+                        f"CHARACTER - {name} [{structured_str}]:\n{raw}")
+                else:
+                    lines.append(f"CHARACTER - {name}: {structured_str}")
+            elif "_raw" in attrs:
                 lines.append(f"CHARACTER - {name}:\n{attrs['_raw']}")
             else:
                 attr_str = "; ".join(f"{k}: {v}" for k, v in attrs.items())
@@ -1118,6 +1326,89 @@ class CharacterBible:
 
     def has_characters(self) -> bool:
         return bool(self._chars)
+
+    def validate_bible(self, current_frame: 'torch.Tensor',
+                       vision_engine: 'VisionDescribeEngine') -> dict:
+        """Run VisionDescribe on the current frame and compare attributes against
+        stored bible entries. Returns a drift report.
+
+        Args:
+            current_frame: The current video frame as a tensor.
+            vision_engine: A VisionDescribeEngine instance for image analysis.
+
+        Returns:
+            dict of {character_name: {attribute: (expected, observed, drifted)}}
+            Empty dict if no structured data or no characters.
+        """
+        if not self._chars:
+            return {}
+
+        # Describe the current frame
+        current_desc = vision_engine.describe(current_frame)
+        current_lower = current_desc.lower()
+
+        drift_report = {}
+        for name, attrs in self._chars.items():
+            structured = attrs.get("_structured", {})
+            if not structured:
+                continue
+
+            char_drift = {}
+
+            # Check hair_color drift
+            if "hair_color" in structured:
+                expected = structured["hair_color"]
+                observed = "unknown"
+                hair_match = re.search(
+                    r'(blonde|brunette|black|brown|red|auburn|grey|gray|white|'
+                    r'silver|dark|light|platinum|golden|ginger|sandy|chestnut|raven)\s+hair',
+                    current_lower)
+                if hair_match:
+                    observed = hair_match.group(1)
+                drifted = (observed != "unknown" and observed != expected.lower())
+                char_drift["hair_color"] = (expected, observed, drifted)
+
+            # Check skin_tone drift
+            if "skin_tone" in structured:
+                expected = structured["skin_tone"]
+                observed = "unknown"
+                skin_match = re.search(
+                    r'(light|dark|medium|olive|fair|pale|tan|deep|warm|cool)[\s-]*skin',
+                    current_lower)
+                if skin_match:
+                    observed = skin_match.group(1)
+                drifted = (observed != "unknown"
+                           and observed.lower() not in expected.lower())
+                char_drift["skin_tone"] = (expected, observed, drifted)
+
+            # Check clothing drift
+            if "clothing" in structured:
+                expected = structured["clothing"].lower()
+                # Extract clothing keywords from expected
+                expected_keywords = set(re.findall(
+                    r'(shirt|pants|dress|jacket|coat|suit|blouse|skirt|jeans|'
+                    r'shorts|hoodie|sweater|top|uniform|gown|robe|vest|hat|'
+                    r'shoes|boots|sneakers|bikini|swimsuit|tank)',
+                    expected))
+                observed_keywords = set(re.findall(
+                    r'(shirt|pants|dress|jacket|coat|suit|blouse|skirt|jeans|'
+                    r'shorts|hoodie|sweater|top|uniform|gown|robe|vest|hat|'
+                    r'shoes|boots|sneakers|bikini|swimsuit|tank)',
+                    current_lower))
+                observed = ", ".join(observed_keywords) if observed_keywords else "unknown"
+                # Drift if significant mismatch (less than half overlap)
+                if expected_keywords and observed_keywords:
+                    overlap = expected_keywords & observed_keywords
+                    drifted = len(overlap) < len(expected_keywords) * 0.5
+                else:
+                    drifted = False
+                char_drift["clothing"] = (
+                    ", ".join(expected_keywords), observed, drifted)
+
+            if char_drift:
+                drift_report[name] = char_drift
+
+        return drift_report
 
     def names(self) -> List[str]:
         return list(self._chars.keys())
@@ -1436,6 +1727,41 @@ def _save(decoded, audio, fps, prefix) -> str:
     return path
 
 
+def _slerp(t: float, v0: torch.Tensor, v1: torch.Tensor) -> torch.Tensor:
+    """Spherical linear interpolation between two tensors.
+
+    Args:
+        t: Interpolation factor (0.0 = v0, 1.0 = v1).
+        v0: Start tensor.
+        v1: End tensor.
+
+    Returns:
+        Interpolated tensor of the same shape.
+    """
+    # Flatten for dot product computation
+    v0_flat = v0.reshape(-1).float()
+    v1_flat = v1.reshape(-1).float()
+
+    # Normalize
+    v0_norm = v0_flat / (v0_flat.norm() + 1e-8)
+    v1_norm = v1_flat / (v1_flat.norm() + 1e-8)
+
+    # Compute angle between vectors
+    dot = torch.clamp(torch.dot(v0_norm, v1_norm), -1.0, 1.0)
+    omega = torch.acos(dot)
+
+    # Fall back to linear interpolation if vectors are nearly parallel
+    if omega.abs() < 1e-6:
+        return ((1.0 - t) * v0 + t * v1).to(v0.dtype)
+
+    sin_omega = torch.sin(omega)
+    coeff_0 = torch.sin((1.0 - t) * omega) / sin_omega
+    coeff_1 = torch.sin(t * omega) / sin_omega
+
+    result = (coeff_0 * v0_flat + coeff_1 * v1_flat).reshape(v0.shape)
+    return result.to(v0.dtype)
+
+
 def generate_clip(
     image_tensor: Optional[torch.Tensor],
     prompt: str,
@@ -1465,6 +1791,7 @@ def generate_clip(
     lora_config: Optional[List[LoRAConfig]] = None,
     skip_audio: bool = False,
     cache_clip_cond: bool = True,
+    blend_mode: str = "pixel",
 ) -> ClipResult:
     """
     Two-pass LTX-2 19B GGUF generation for one clip.
@@ -1478,6 +1805,9 @@ def generate_clip(
         single pass on the full concatenated video.
     cache_clip_cond: If True, cache CLIP conditioning on CPU for reuse across
         clips with the same prompt (saves loading CLIP again).
+    blend_mode: Anchor blending strategy. 'pixel' (default) blends image tensors
+        in pixel space. 'latent_slerp' encodes both images through VAE and
+        performs spherical linear interpolation in latent space using anchor_weight.
     """
     _load_comfy_nodes()
 
@@ -1502,10 +1832,86 @@ def generate_clip(
         up_mdl = get_value_at_index(uml.EXECUTE_NORMALIZED(model_name=_M_UP), 0)
 
         # -- STEP 4: Latent preparation --
-        av_lat = _prepare_latents(image_tensor, width, height, frames, fps,
-                                  vae_v, vae_a, image_strength,
-                                  anchor_image, anchor_weight,
-                                  skip_audio=skip_audio)
+        # When blend_mode is 'latent_slerp' and anchor_image is available,
+        # bypass normal pixel blending: encode both images separately through VAE,
+        # perform slerp interpolation, then condition on the interpolated latent.
+        if blend_mode == "latent_slerp" and anchor_image is not None and image_tensor is not None:
+            # Encode both images to latent space via VAE
+            rim_slerp = _get_node("ResizeImageMaskNode")
+            ei_sz = _get_node("EmptyImage")
+            full_sz = ei_sz.generate(width=width, height=height, batch_size=1, color=0)
+            rimn_sz = _get_node("ResizeImageMaskNode")
+            half_sz = rimn_sz.EXECUTE_NORMALIZED(
+                input=get_value_at_index(full_sz, 0), scale_method="area",
+                resize_type={"resize_type": "scale by multiplier", "multiplier": 0.5})
+            gis_sz = _get_node("GetImageSize")
+            hsz_lat = gis_sz.EXECUTE_NORMALIZED(image=get_value_at_index(half_sz, 0))
+            hw_lat = get_value_at_index(hsz_lat, 0)
+            hh_lat = get_value_at_index(hsz_lat, 1)
+
+            # Resize and encode image_tensor
+            ri_img = rim_slerp.EXECUTE_NORMALIZED(
+                input=image_tensor, scale_method="lanczos",
+                resize_type={"resize_type": "scale dimensions",
+                             "width": hw_lat * 2, "height": hh_lat * 2, "crop": "center"})
+            ppn_img = _get_node("LTXVPreprocess")
+            pp_img = get_value_at_index(ppn_img.EXECUTE_NORMALIZED(
+                img_compression=33, image=get_value_at_index(ri_img, 0)), 0)
+
+            # Resize and encode anchor_image
+            ri_anc = rim_slerp.EXECUTE_NORMALIZED(
+                input=anchor_image, scale_method="lanczos",
+                resize_type={"resize_type": "scale dimensions",
+                             "width": hw_lat * 2, "height": hh_lat * 2, "crop": "center"})
+            pp_anc = get_value_at_index(ppn_img.EXECUTE_NORMALIZED(
+                img_compression=33, image=get_value_at_index(ri_anc, 0)), 0)
+
+            # Encode to latent via VAE
+            vae_enc = _get_node("VAEEncode")
+            lat_img = get_value_at_index(vae_enc.encode(vae=vae_v, pixels=pp_img), 0)
+            lat_anc = get_value_at_index(vae_enc.encode(vae=vae_v, pixels=pp_anc), 0)
+
+            # Slerp interpolation in latent space (anchor_weight controls blend)
+            lat_img_samples = lat_img["samples"]
+            lat_anc_samples = lat_anc["samples"]
+            interpolated = _slerp(anchor_weight, lat_img_samples, lat_anc_samples)
+
+            # Use interpolated latent as the I2V conditioning
+            eltxv_sl = _get_node("EmptyLTXVLatentVideo")
+            vid_lat_sl = eltxv_sl.EXECUTE_NORMALIZED(
+                width=hw_lat, height=hh_lat, length=frames, batch_size=1)
+            # Inject interpolated latent via LTXVImgToVideoInplace
+            i2v_sl = _get_node("LTXVImgToVideoInplace")
+            # Decode the interpolated latent back to image for I2V node
+            vae_dec_tmp = _get_node("VAEDecode")
+            interp_decoded = get_value_at_index(
+                vae_dec_tmp.decode(vae=vae_v,
+                                   samples={"samples": interpolated}), 0)
+            vid_lat_sl_result = i2v_sl.EXECUTE_NORMALIZED(
+                strength=image_strength, bypass=False,
+                vae=vae_v, image=interp_decoded,
+                latent=get_value_at_index(vid_lat_sl, 0))
+
+            # Build AV latent (add audio or skip)
+            if not skip_audio:
+                elalat_sl = _get_node("LTXVEmptyLatentAudio")
+                aud_lat_sl = elalat_sl.EXECUTE_NORMALIZED(
+                    frames_number=frames, frame_rate=fps,
+                    batch_size=1, audio_vae=vae_a)
+                clat_sl = _get_node("LTXVConcatLatentAV")
+                av_lat = get_value_at_index(
+                    clat_sl.EXECUTE_NORMALIZED(
+                        video_latent=get_value_at_index(vid_lat_sl_result, 0),
+                        audio_latent=get_value_at_index(aud_lat_sl, 0)), 0)
+            else:
+                av_lat = get_value_at_index(vid_lat_sl_result, 0)
+            print("   [Clip] Latent slerp blend applied (anchor_weight="
+                  f"{anchor_weight:.2f})")
+        else:
+            av_lat = _prepare_latents(image_tensor, width, height, frames, fps,
+                                      vae_v, vae_a, image_strength,
+                                      anchor_image, anchor_weight,
+                                      skip_audio=skip_audio)
 
         # -- STEP 5: Pass 1 --
         p1_av = _pass1(unet, cond, av_lat, seed,
@@ -1619,6 +2025,7 @@ class InfiniteFlowEngine:
         transition_duration_sec: float = 0.5,
         audio_continuity: bool = True,
         batch_prompts: bool = True,
+        drift_check_interval: int = 3,
     ):
         self.bible = character_bible or CharacterBible()
         self.llm_model = llm_model
@@ -1642,6 +2049,7 @@ class InfiniteFlowEngine:
         self.transition_duration_sec = transition_duration_sec
         self.audio_continuity = audio_continuity
         self.batch_prompts = batch_prompts
+        self.drift_check_interval = drift_check_interval
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
         self._vision_engine = VisionDescribeEngine(vision_model, offline)
@@ -1903,11 +2311,20 @@ class InfiniteFlowEngine:
             print(f"[IFE] Seed image loaded: {seed_image_path}")
             if not self.bible.has_characters() and self.use_vision:
                 print("[IFE] Extracting Character Bible from seed image...")
-                desc = self._vision_engine.describe(current_image)
+                chars = self._vision_engine.describe_characters(current_image)
                 _vram_free()
-                self.bible.extract_from_description("Main Character", desc)
-                self._scene_history.append(desc)
-                print(f"[IFE] Bible set:\n{desc[:200]}...\n")
+                if len(chars) > 1:
+                    # Multiple characters detected
+                    for entry in chars:
+                        char_name = f"Character {entry['index']}"
+                        self.bible.parse_structured(char_name, entry["description"])
+                    print(f"[IFE] Bible set: {len(chars)} characters detected.")
+                else:
+                    # Single character or no people
+                    desc = chars[0]["description"] if chars else ""
+                    self.bible.parse_structured("Main Character", desc)
+                    self._scene_history.append(desc)
+                    print(f"[IFE] Bible set:\n{desc[:200]}...\n")
 
         # Enable vision engine keep_loaded during prompt phase
         self._vision_engine.keep_loaded = True
@@ -1945,6 +2362,20 @@ class InfiniteFlowEngine:
                 print(f"[IFE]    Last frame extracted for beat {beat_idx + 1}.")
             else:
                 print("[IFE]    No last frame - next beat will be T2V.")
+
+            # Drift check every N beats
+            if (self.drift_check_interval > 0
+                    and beat_idx % self.drift_check_interval == 0
+                    and current_image is not None
+                    and self.bible.has_characters()):
+                print(f"[IFE]    Running bible drift check (interval={self.drift_check_interval})...")
+                drift_report = self.bible.validate_bible(current_image, self._vision_engine)
+                _vram_free()
+                for char_name, attrs in drift_report.items():
+                    for attr_name, (expected, observed, drifted) in attrs.items():
+                        if drifted:
+                            print(f"   [DRIFT WARNING] {char_name}.{attr_name}: "
+                                  f"expected='{expected}', observed='{observed}'")
 
             # Preview
             if self.show_previews:
@@ -1988,10 +2419,17 @@ class InfiniteFlowEngine:
             print(f"[IFE-TE] Seed/anchor image loaded: {seed_image_path}")
             if not self.bible.has_characters() and self.use_vision:
                 print("[IFE-TE] Extracting Character Bible from seed image...")
-                desc = self._vision_engine.describe(current_image)
+                chars = self._vision_engine.describe_characters(current_image)
                 _vram_free()
-                self.bible.extract_from_description("Main Character", desc)
-                self._scene_history.append(desc)
+                if len(chars) > 1:
+                    for entry in chars:
+                        char_name = f"Character {entry['index']}"
+                        self.bible.parse_structured(char_name, entry["description"])
+                    print(f"[IFE-TE] Bible set: {len(chars)} characters detected.")
+                else:
+                    desc = chars[0]["description"] if chars else ""
+                    self.bible.parse_structured("Main Character", desc)
+                    self._scene_history.append(desc)
 
         total_segments = 1 + self.extensions_per_clip
         print(f"\n[IFE-TE] TEMPORAL EXTEND MODE")
@@ -2097,6 +2535,22 @@ class InfiniteFlowEngine:
                 # Fallback to anchor_samples if last frame extraction fails
                 current_image = anchor_samples
                 print("[IFE-TE]    Using anchor_samples as fallback for next extension.")
+
+            # Drift check every N segments
+            if (self.drift_check_interval > 0
+                    and (seg_idx + 1) % self.drift_check_interval == 0
+                    and current_image is not None
+                    and self.bible.has_characters()):
+                print(f"[IFE-TE]    Running bible drift check "
+                      f"(interval={self.drift_check_interval})...")
+                drift_report = self.bible.validate_bible(
+                    current_image, self._vision_engine)
+                _vram_free()
+                for char_name, attrs in drift_report.items():
+                    for attr_name, (expected, observed, drifted) in attrs.items():
+                        if drifted:
+                            print(f"   [DRIFT WARNING] {char_name}.{attr_name}: "
+                                  f"expected='{expected}', observed='{observed}'")
 
             if self.show_previews:
                 display_video(dest)

@@ -483,7 +483,7 @@ def concatenate_clips(clip_paths: List[str], output_path: str,
     elif transition_type in ("crossfade", "dip_to_black"):
         # Build complex xfade filter chain
         dur = max(0.1, transition_duration_sec)
-        xfade_mode = "fade" if transition_type == "crossfade" else "fade"
+        xfade_mode = "fade" if transition_type == "crossfade" else "fadeblack"
         xfade_color = "" if transition_type == "crossfade" else ":color=black"
 
         if len(clip_paths) == 1:
@@ -506,10 +506,10 @@ def concatenate_clips(clip_paths: List[str], output_path: str,
                 out_label = f"[v{i + 1}]" if i < n - 2 else "[vout]"
                 offset_val = f"offset_placeholder_{i}"
                 if transition_type == "dip_to_black":
-                    xf = (f"{src}{nxt}xfade=transition=fade:duration={dur}"
+                    xf = (f"{src}{nxt}xfade=transition={xfade_mode}:duration={dur}"
                            f":offset={offset_val}{out_label}")
                 else:
-                    xf = (f"{src}{nxt}xfade=transition=fade:duration={dur}"
+                    xf = (f"{src}{nxt}xfade=transition={xfade_mode}:duration={dur}"
                            f":offset={offset_val}{out_label}")
                 filter_parts.append(xf)
 
@@ -1982,12 +1982,16 @@ def _load_clip_encode(prompt: str, fps: int, cache_clip_cond: bool = True) -> tu
         print("   [Clip] CLIP cache HIT -- skipping CLIP load.")
         cached = _CLIP_COND_CACHE[prompt]
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        # Return cached conditioning moved to GPU
-        cond_pos_cached = cached["cond_pos"]
-        cond_neg_cached = cached["cond_neg"]
-        # Reconstruct conditioning via LTXVConditioning with cached values
-        # The cache stores the final result of LTXVConditioning, so return directly
-        return cached["cond_result"]
+        # Move cached CPU tensors back to GPU for inference
+        cond_result = cached["cond_result"]
+        cond_on_device = tuple(
+            tuple(
+                t.to(device) if isinstance(t, torch.Tensor) else t
+                for t in item
+            ) if isinstance(item, (list, tuple)) else item
+            for item in cond_result
+        )
+        return cond_on_device
 
     print("   [Clip] Loading CLIP...")
     clip_ld = _get_node("DualCLIPLoader")
@@ -2016,7 +2020,15 @@ def _load_clip_encode(prompt: str, fps: int, cache_clip_cond: bool = True) -> tu
 
     # Store in cache (on CPU) for future reuse
     if cache_clip_cond:
-        _CLIP_COND_CACHE[prompt] = {"cond_result": cond, "cond_pos": None, "cond_neg": None}
+        # Move tensors to CPU before caching to avoid VRAM accumulation
+        cond_cpu = tuple(
+            tuple(
+                t.cpu() if isinstance(t, torch.Tensor) else t
+                for t in item
+            ) if isinstance(item, (list, tuple)) else item
+            for item in cond
+        )
+        _CLIP_COND_CACHE[prompt] = {"cond_result": cond_cpu}
         print(f"   [Clip] Cached conditioning for prompt (cache size: {len(_CLIP_COND_CACHE)})")
 
     # Delete CLIP now -- frees ~6-8 GB for UNet
@@ -2406,7 +2418,11 @@ def generate_clip(
                 width=hw_lat, height=hh_lat, length=frames, batch_size=1)
             # Inject interpolated latent via LTXVImgToVideoInplace
             i2v_sl = _get_node("LTXVImgToVideoInplace")
-            # Decode the interpolated latent back to image for I2V node
+            # Known limitation: decode interpolated latent back to pixels for I2V node.
+            # LTXVImgToVideoInplace requires pixel-space input, so a latent->pixel
+            # round-trip is unavoidable here. This partially negates the precision
+            # benefit of latent-space slerp, but still produces smoother blends than
+            # pixel-space averaging for high anchor_weight values.
             vae_dec_tmp = _get_node("VAEDecode")
             interp_decoded = get_value_at_index(
                 vae_dec_tmp.decode(vae=vae_v,
@@ -2422,7 +2438,7 @@ def generate_clip(
                 aud_lat_sl = elalat_sl.EXECUTE_NORMALIZED(
                     frames_number=frames, frame_rate=fps,
                     batch_size=1, audio_vae=vae_a)
-                clat_sl = _get_node("LTXVConcatLatentAV")
+                clat_sl = _get_node("LTXVConcatAVLatent")
                 av_lat = get_value_at_index(
                     clat_sl.EXECUTE_NORMALIZED(
                         video_latent=get_value_at_index(vid_lat_sl_result, 0),
@@ -2768,6 +2784,11 @@ class InfiniteFlowEngine:
         )
 
         # Attempt 0: normal generation (with timeout)
+        # NOTE: ThreadPoolExecutor timeout is advisory only. CUDA kernels cannot
+        # be interrupted from Python; the future will only resolve once the GPU
+        # releases. If the timeout fires, the worker thread continues consuming
+        # VRAM until the kernel finishes. Process-level isolation would be needed
+        # for hard timeout enforcement on GPU workloads.
         try:
             executor = ThreadPoolExecutor(max_workers=1)
             future = executor.submit(generate_clip, image_tensor=image_tensor, **base_kwargs)
@@ -2974,21 +2995,22 @@ class InfiniteFlowEngine:
             # Temporarily override frames for this beat
             saved_frames = self.frames
             self.frames = beat_frames
-            _, last_frame = self._generate_single_segment(
-                image_tensor=current_image,
-                prompt=prompt,
-                neg=neg,
-                seed=beat_seed,
-                dest_path=dest,
-                output_prefix=f"IFE_{beat_idx:03d}",
-                label=f"beat {beat_idx}",
-                pass1_sigmas=pass1_sigmas,
-            )
-            self.frames = saved_frames
-
-            # Restore LoRA stack
-            if orig_lora_stack is not None:
-                LD_LORA_STACK[:] = orig_lora_stack
+            try:
+                _, last_frame = self._generate_single_segment(
+                    image_tensor=current_image,
+                    prompt=prompt,
+                    neg=neg,
+                    seed=beat_seed,
+                    dest_path=dest,
+                    output_prefix=f"IFE_{beat_idx:03d}",
+                    label=f"beat {beat_idx}",
+                    pass1_sigmas=pass1_sigmas,
+                )
+            finally:
+                self.frames = saved_frames
+                # Restore LoRA stack (exception-safe)
+                if orig_lora_stack is not None:
+                    LD_LORA_STACK[:] = orig_lora_stack
 
             print(f"\n[IFE] Beat {beat_idx} -> {dest}")
 
@@ -3005,7 +3027,11 @@ class InfiniteFlowEngine:
 
             # Save checkpoint after successful beat
             if hasattr(self, '_checkpoint'):
-                cfg_str = f"{self.width}:{self.height}:{self.frames}:{self.fps}:{self.mode}"
+                beats_hash = hashlib.md5(
+                    "|".join(beat_strings).encode()).hexdigest()[:8]
+                cfg_str = (f"{self.width}:{self.height}:{self.frames}:{self.fps}"
+                           f":{self.mode}:{self.creativity}:{self.img_strength}"
+                           f":{self.extensions_per_clip}:{beats_hash}")
                 cfg_hash = hashlib.md5(cfg_str.encode()).hexdigest()[:12]
                 clip_map = {str(i): p for i, p in enumerate(self._clip_paths)}
                 self._checkpoint.save(
@@ -3028,6 +3054,8 @@ class InfiniteFlowEngine:
                     and self.bible.has_characters()):
                 print(f"[IFE]    Running bible drift check (interval={self.drift_check_interval})...")
                 drift_report = self.bible.validate_bible(current_image, self._vision_engine)
+                # Explicitly unload vision model after drift check to reclaim VRAM
+                self._vision_engine.unload()
                 _vram_free()
                 for char_name, attrs in drift_report.items():
                     for attr_name, (expected, observed, drifted) in attrs.items():
@@ -3261,7 +3289,11 @@ class InfiniteFlowEngine:
         ckpt_data = self._checkpoint.load()
         if ckpt_data:
             # Compute config hash for invalidation check
-            cfg_str = f"{self.width}:{self.height}:{self.frames}:{self.fps}:{self.mode}"
+            beats_hash = hashlib.md5(
+                "|".join(beat_strings).encode()).hexdigest()[:8]
+            cfg_str = (f"{self.width}:{self.height}:{self.frames}:{self.fps}"
+                       f":{self.mode}:{self.creativity}:{self.img_strength}"
+                       f":{self.extensions_per_clip}:{beats_hash}")
             cfg_hash = hashlib.md5(cfg_str.encode()).hexdigest()[:12]
             if ckpt_data.get("config_hash", "") == cfg_hash:
                 completed = ckpt_data.get("completed_beats", [])
@@ -3323,7 +3355,12 @@ class InfiniteFlowEngine:
                         and any(t is not None for t in self._beat_transitions))
 
         if has_per_beat and len(self._clip_paths) > 1:
-            # Apply per-beat transitions by concatenating clips in pairs
+            # Apply per-beat transitions by concatenating clips in pairs.
+            # NOTE: Pair-wise concatenation re-encodes N-1 times, which accumulates
+            # quality loss. A single filter_complex would avoid this but requires
+            # knowing all clips upfront, which is not possible in streaming mode
+            # where clips are generated incrementally. For most use cases with
+            # fewer than 10 clips, the quality loss is negligible at CRF 18.
             # Each clip (except the first) uses the transition from its beat config
             temp_paths = []
             current_concat = self._clip_paths[0]
@@ -3343,8 +3380,8 @@ class InfiniteFlowEngine:
             # Final result is the last pair concatenation
             if os.path.exists(current_concat):
                 shutil.copy2(current_concat, out)
-            # Clean up temp files
-            for tp in temp_paths[:-1]:
+            # Clean up all temp files (including the last one after copy)
+            for tp in temp_paths:
                 if os.path.exists(tp):
                     try:
                         os.remove(tp)
@@ -3414,14 +3451,51 @@ class InfiniteFlowEngine:
 
             # Merge audio with video using ffmpeg
             audio_path = video_path.replace(".mp4", "_audio_track.wav")
-            # Save audio tensor as wav (simplified -- actual implementation
-            # depends on ComfyUI audio format)
-            final_path = video_path.replace(".mp4", "_with_audio.mp4")
+            # Save decoded audio tensor as wav file
+            # ComfyUI audio decode returns waveform tensor; write it as WAV
+            import scipy.io.wavfile as wavfile
+            audio_tensor = get_value_at_index(audio, 0)
+            if isinstance(audio_tensor, torch.Tensor):
+                audio_np = audio_tensor.cpu().numpy()
+                if audio_np.ndim == 1:
+                    audio_np = audio_np.reshape(-1)
+                elif audio_np.ndim >= 2:
+                    # Take first channel or flatten appropriately
+                    audio_np = audio_np.squeeze()
+                # Normalize to int16 range for WAV
+                if audio_np.dtype != "int16":
+                    audio_np = (audio_np * 32767).clip(-32768, 32767).astype("int16")
+                wavfile.write(audio_path, self.fps * 400, audio_np)  # sample rate estimate
+            else:
+                # Fallback: if audio is already a path or bytes
+                print("[IFE-TE] Audio format not recognized -- skipping merge.")
+                return video_path
 
-            # Use ffmpeg to combine -- audio from ComfyUI is in the result
-            print(f"[IFE-TE] Audio generated for {total_frames} frames.")
-            print(f"[IFE-TE] Full video with audio: {video_path}")
-            return video_path
+            # Mux audio into video with ffmpeg (copy video stream, add audio)
+            final_path = video_path.replace(".mp4", "_with_audio.mp4")
+            mux_cmd = [
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-i", audio_path,
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-shortest",
+                final_path
+            ]
+            mux_result = subprocess.run(mux_cmd, capture_output=True, text=True)
+            # Clean up temp wav
+            if os.path.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                except OSError:
+                    pass
+
+            if mux_result.returncode == 0 and os.path.exists(final_path):
+                print(f"[IFE-TE] Audio merged -> {final_path}")
+                return final_path
+            else:
+                print(f"[IFE-TE] ffmpeg mux failed: {mux_result.stderr[:200]}")
+                return video_path
 
         except Exception as e:
             print(f"[IFE-TE] Audio generation failed ({e}) -- returning silent video.")

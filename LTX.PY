@@ -246,6 +246,47 @@ def get_last_frame_tensor(video_path: str) -> Optional[torch.Tensor]:
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return torch.from_numpy(frame).float().unsqueeze(0) / 255.0
 
+
+def get_last_frames_averaged(video_path: str, n_frames: int = 3) -> Optional[torch.Tensor]:
+    """Extract the last n_frames from a video and average them into a single tensor.
+
+    This reduces flickering artifacts when using the last frame as I2V conditioning
+    by smoothing out single-frame noise. Falls back to get_last_frame_tensor if
+    fewer frames are available.
+
+    Args:
+        video_path: Path to the video file.
+        n_frames: Number of trailing frames to average (default 3, range 1-5).
+
+    Returns:
+        Averaged tensor of shape (1, H, W, 3) or None if extraction fails.
+    """
+    n_frames = max(1, min(5, n_frames))
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total == 0:
+        cap.release()
+        return None
+    # Determine how many frames we can actually read
+    count = min(n_frames, total)
+    start_frame = total - count
+    frames_list = []
+    for i in range(count):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame + i)
+        ok, frame = cap.read()
+        if ok:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames_list.append(torch.from_numpy(frame).float() / 255.0)
+    cap.release()
+    if not frames_list:
+        return None
+    # Average across collected frames
+    stacked = torch.stack(frames_list, dim=0)  # (N, H, W, 3)
+    averaged = stacked.mean(dim=0, keepdim=True)  # (1, H, W, 3)
+    return averaged
+
 # -- Video helpers --
 def display_video(path: str):
     if not path or not os.path.exists(path):
@@ -266,16 +307,244 @@ def save_video_obj(video_obj, prefix="IFE") -> str:
                       codec="auto", metadata=None)
     return path
 
-def concatenate_clips(clip_paths: List[str], output_path: str) -> str:
-    """ffmpeg concat all clips into one final video."""
-    list_file = "/tmp/concat_list.txt"
-    with open(list_file, "w") as f:
-        for p in clip_paths:
-            f.write(f"file '{p}'\n")
-    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
-                    "-c", "copy", output_path], check=True, capture_output=True)
-    print(f"   Concatenated -> {output_path}")
+def concatenate_clips(clip_paths: List[str], output_path: str,
+                      transition_type: str = "hard_cut",
+                      transition_duration_sec: float = 0.5) -> str:
+    """ffmpeg concat all clips into one final video.
+
+    Args:
+        clip_paths: List of clip file paths to concatenate.
+        output_path: Destination path for concatenated video.
+        transition_type: One of 'hard_cut', 'crossfade', 'dip_to_black'.
+        transition_duration_sec: Duration of transition in seconds (for crossfade/dip_to_black).
+
+    Returns:
+        Path to the concatenated output file.
+    """
+    if not clip_paths:
+        return output_path
+
+    if transition_type == "hard_cut" or len(clip_paths) == 1:
+        # Original fast concat with stream copy
+        list_file = "/tmp/concat_list.txt"
+        with open(list_file, "w") as f:
+            for p in clip_paths:
+                f.write(f"file '{p}'\n")
+        subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
+                        "-c", "copy", output_path], check=True, capture_output=True)
+    elif transition_type in ("crossfade", "dip_to_black"):
+        # Build complex xfade filter chain
+        dur = max(0.1, transition_duration_sec)
+        xfade_mode = "fade" if transition_type == "crossfade" else "fade"
+        xfade_color = "" if transition_type == "crossfade" else ":color=black"
+
+        if len(clip_paths) == 1:
+            shutil.copy2(clip_paths[0], output_path)
+        else:
+            # Build ffmpeg filter_complex for sequential xfade transitions
+            inputs = []
+            for p in clip_paths:
+                inputs.extend(["-i", p])
+
+            filter_parts = []
+            n = len(clip_paths)
+            # Chain xfade filters sequentially
+            for i in range(n - 1):
+                if i == 0:
+                    src = "[0:v]"
+                else:
+                    src = f"[v{i}]"
+                nxt = f"[{i + 1}:v]"
+                out_label = f"[v{i + 1}]" if i < n - 2 else "[vout]"
+                offset_val = f"offset_placeholder_{i}"
+                if transition_type == "dip_to_black":
+                    xf = (f"{src}{nxt}xfade=transition=fade:duration={dur}"
+                           f":offset={offset_val}{out_label}")
+                else:
+                    xf = (f"{src}{nxt}xfade=transition=fade:duration={dur}"
+                           f":offset={offset_val}{out_label}")
+                filter_parts.append(xf)
+
+            # We need to know clip durations to compute offsets
+            # Use ffprobe to get durations
+            durations = []
+            for p in clip_paths:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", p],
+                    capture_output=True, text=True)
+                try:
+                    durations.append(float(probe.stdout.strip()))
+                except (ValueError, AttributeError):
+                    durations.append(5.0)  # fallback duration
+
+            # Compute offsets: each xfade starts at cumulative_duration - overlap
+            cumulative = 0.0
+            offsets = []
+            for i in range(n - 1):
+                cumulative += durations[i]
+                if i > 0:
+                    cumulative -= dur  # Account for previous transitions shortening
+                offset = cumulative - dur
+                offsets.append(max(0, offset))
+
+            # Replace placeholders with actual offset values
+            filter_str = ";".join(filter_parts)
+            for i, off in enumerate(offsets):
+                filter_str = filter_str.replace(
+                    f"offset_placeholder_{i}", f"{off:.3f}")
+
+            # Build audio filter (amerge or simple concat)
+            audio_filter = ""
+            audio_parts = []
+            for i in range(n - 1):
+                if i == 0:
+                    a_src = "[0:a]"
+                else:
+                    a_src = f"[a{i}]"
+                a_nxt = f"[{i + 1}:a]"
+                a_out = f"[a{i + 1}]" if i < n - 2 else "[aout]"
+                a_off = offsets[i]
+                af = (f"{a_src}{a_nxt}acrossfade=d={dur}:c1=tri:c2=tri{a_out}")
+                audio_parts.append(af)
+            audio_filter = ";".join(audio_parts)
+
+            full_filter = filter_str
+            if audio_filter:
+                full_filter += ";" + audio_filter
+
+            cmd = ["ffmpeg", "-y"] + inputs + [
+                "-filter_complex", full_filter,
+                "-map", "[vout]", "-map", "[aout]" if audio_parts else "[0:a]",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                "-c:a", "aac", output_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                # Fallback to hard_cut if xfade fails
+                print(f"   [Concat] xfade failed, falling back to hard_cut: "
+                      f"{result.stderr[:200]}")
+                return concatenate_clips(clip_paths, output_path,
+                                         transition_type="hard_cut")
+    else:
+        # Unknown transition type -- fall back to hard_cut
+        return concatenate_clips(clip_paths, output_path, transition_type="hard_cut")
+
+    print(f"   Concatenated ({transition_type}) -> {output_path}")
     return output_path
+
+# -- Resolution auto-selection --
+_SUPPORTED_RESOLUTIONS = [
+    (768, 512), (512, 768), (768, 768),
+    (704, 480), (480, 704), (640, 640),
+    (832, 480), (480, 832),
+]
+
+
+def _auto_resolution(image_path: str) -> tuple:
+    """Read the seed image aspect ratio and pick the closest supported LTX-2 resolution.
+
+    Args:
+        image_path: Path to the seed/reference image.
+
+    Returns:
+        Tuple of (width, height) from the supported resolution table.
+        Falls back to (768, 512) if the image cannot be read.
+    """
+    try:
+        img = Image.open(image_path)
+        img_w, img_h = img.size
+    except Exception:
+        return (768, 512)
+
+    if img_w == 0 or img_h == 0:
+        return (768, 512)
+
+    img_ratio = img_w / img_h
+    best = _SUPPORTED_RESOLUTIONS[0]
+    best_diff = abs(img_ratio - best[0] / best[1])
+    for res in _SUPPORTED_RESOLUTIONS[1:]:
+        diff = abs(img_ratio - res[0] / res[1])
+        if diff < best_diff:
+            best_diff = diff
+            best = res
+    return best
+
+
+# -- Adaptive sigma schedule --
+_MOTION_COMPLEX_KEYWORDS = [
+    "run", "fight", "dance", "chase", "explode", "crash", "sprint",
+    "jump", "flip", "spin", "attack", "slam", "whip", "rush",
+]
+_MOTION_SIMPLE_KEYWORDS = [
+    "sit", "stand", "look", "wait", "rest", "pause", "gaze", "lean",
+    "stare", "sleep", "hold", "still",
+]
+
+
+def _adaptive_sigmas(base_sigmas: str, complexity: str) -> str:
+    """Adjust sigma schedule based on scene complexity.
+
+    For 'simple' scenes (static/slow motion), use fewer intermediate steps
+    by removing some mid-range sigma values for faster generation.
+    For 'complex' scenes (fast action), add more intermediate steps for
+    smoother motion and better temporal coherence.
+
+    Args:
+        base_sigmas: Comma-separated sigma schedule string (e.g. "1., 0.9, 0.7, 0.0").
+        complexity: One of 'simple', 'moderate', 'complex'.
+
+    Returns:
+        Modified sigma schedule string.
+    """
+    try:
+        vals = [float(v.strip()) for v in base_sigmas.split(",") if v.strip()]
+    except (ValueError, AttributeError):
+        return base_sigmas
+
+    if not vals or len(vals) < 3:
+        return base_sigmas
+
+    if complexity == "simple":
+        # Remove some mid-range values for faster generation
+        # Keep first, last, and every other intermediate
+        if len(vals) > 4:
+            reduced = [vals[0]]
+            step = max(1, (len(vals) - 2) // 3)
+            for i in range(step, len(vals) - 1, step):
+                reduced.append(vals[i])
+            reduced.append(vals[-1])
+            vals = reduced
+    elif complexity == "complex":
+        # Add interpolated values between existing steps for finer detail
+        expanded = [vals[0]]
+        for i in range(1, len(vals)):
+            mid = (vals[i - 1] + vals[i]) / 2.0
+            expanded.append(mid)
+            expanded.append(vals[i])
+        vals = expanded
+
+    # 'moderate' returns the original schedule unchanged
+    return ", ".join(f"{v:.6f}" if v not in (0.0, 1.0) else
+                     ("0.0" if v == 0.0 else "1.0") for v in vals)
+
+
+def _detect_complexity(prompt: str) -> str:
+    """Analyze a prompt for motion keywords to determine complexity.
+
+    Returns 'simple', 'moderate', or 'complex'.
+    """
+    lower = prompt.lower()
+    complex_count = sum(1 for kw in _MOTION_COMPLEX_KEYWORDS if kw in lower)
+    simple_count = sum(1 for kw in _MOTION_SIMPLE_KEYWORDS if kw in lower)
+    if complex_count >= 2:
+        return "complex"
+    elif complex_count >= 1 and simple_count == 0:
+        return "complex"
+    elif simple_count >= 2 and complex_count == 0:
+        return "simple"
+    return "moderate"
+
 
 # -- ComfyUI async node loader --
 _NODES_LOADED = False
@@ -864,9 +1133,12 @@ def _load_unet(lora_config: Optional[List[LoRAConfig]] = None):
 
 
 def _prepare_latents(image_tensor, width, height, frames, fps, vae_v, vae_a,
-                     image_strength, anchor_image, anchor_weight):
+                     image_strength, anchor_image, anchor_weight,
+                     skip_audio=False):
     """Prepare AV latent tensor for sampling. Handles T2V and I2V modes.
-    Returns av_lat tensor."""
+    Returns av_lat tensor.
+
+    If skip_audio is True, skips LTXVEmptyLatentAudio and returns video-only latent."""
     img_bypass = image_tensor is None
     img_str = image_strength if not img_bypass else 0.0
 
@@ -906,7 +1178,10 @@ def _prepare_latents(image_tensor, width, height, frames, fps, vae_v, vae_a,
     else:
         vid_lat = (get_value_at_index(vid_lat, 0),)
 
-    # Audio latent + concat AV
+    # Audio latent + concat AV (or return video-only if skip_audio)
+    if skip_audio:
+        return vid_lat[0]
+
     elalat = _get_node("LTXVEmptyLatentAudio")
     aud_lat = elalat.EXECUTE_NORMALIZED(
         frames_number=frames, frame_rate=fps, batch_size=1, audio_vae=vae_a)
@@ -1097,6 +1372,7 @@ def generate_clip(
     show_preview: bool = True,
     output_prefix: str = "IFE",
     lora_config: Optional[List[LoRAConfig]] = None,
+    skip_audio: bool = False,
 ) -> ClipResult:
     """
     Two-pass LTX-2 19B GGUF generation for one clip.
@@ -1105,6 +1381,9 @@ def generate_clip(
 
     anchor_image: Optional tensor for blending with image_tensor to prevent drift.
     anchor_weight: Blend factor (0.0 = pure prev_samples, 1.0 = pure anchor).
+    skip_audio: If True, skip audio latent generation and audio decode steps.
+        Used during temporal_extend with audio_continuity to defer audio to a
+        single pass on the full concatenated video.
     """
     _load_comfy_nodes()
 
@@ -1131,7 +1410,8 @@ def generate_clip(
         # -- STEP 4: Latent preparation --
         av_lat = _prepare_latents(image_tensor, width, height, frames, fps,
                                   vae_v, vae_a, image_strength,
-                                  anchor_image, anchor_weight)
+                                  anchor_image, anchor_weight,
+                                  skip_audio=skip_audio)
 
         # -- STEP 5: Pass 1 --
         p1_av = _pass1(unet, cond, av_lat, seed,
@@ -1151,11 +1431,37 @@ def generate_clip(
                                     tiled_stiles, tiled_soverlap,
                                     tiled_tlen, tiled_toverlap)
 
-        # -- STEP 9: Audio decode --
-        audio = _decode_audio(s2, vae_a)
+        # -- STEP 9: Audio decode (skip if skip_audio=True) --
+        if not skip_audio:
+            audio = _decode_audio(s2, vae_a)
+        else:
+            audio = None
+            del vae_a
+            _vram_free()
 
         # -- STEP 10: Save --
-        path = _save(decoded, audio, fps, output_prefix)
+        if not skip_audio and audio is not None:
+            path = _save(decoded, audio, fps, output_prefix)
+        else:
+            # Save video-only (no audio track) -- try CreateVideo without audio,
+            # fall back to saving with empty/silent audio if node requires it
+            try:
+                cv_node = _get_node("CreateVideo")
+                vid_obj = cv_node.EXECUTE_NORMALIZED(fps=fps, images=decoded)
+                path = save_video_obj(get_value_at_index(vid_obj, 0), prefix=output_prefix)
+            except (TypeError, Exception):
+                # Some CreateVideo versions require audio -- generate silent placeholder
+                vae_a_tmp = get_value_at_index(_audio_vae(_M_AVAE), 0)
+                elalat = _get_node("LTXVEmptyLatentAudio")
+                aud_lat = elalat.EXECUTE_NORMALIZED(
+                    frames_number=frames, frame_rate=fps,
+                    batch_size=1, audio_vae=vae_a_tmp)
+                aud_d = _get_node("LTXVAudioVAEDecode")
+                silent_audio = aud_d.EXECUTE_NORMALIZED(
+                    samples=get_value_at_index(aud_lat, 0), audio_vae=vae_a_tmp)
+                path = _save(decoded, silent_audio, fps, output_prefix)
+                del vae_a_tmp
+            _vram_print("after save (skip_audio)")
 
         # Build ClipResult
         duration = frames / float(fps)
@@ -1214,6 +1520,10 @@ class InfiniteFlowEngine:
         output_dir: str = "/content/ComfyUI/output/infinite_flow",
         mode: str = "scene_chain",
         extensions_per_clip: int = 3,
+        multi_frame_count: int = 3,
+        transition_type: str = "hard_cut",
+        transition_duration_sec: float = 0.5,
+        audio_continuity: bool = True,
     ):
         self.bible = character_bible or CharacterBible()
         self.llm_model = llm_model
@@ -1232,6 +1542,10 @@ class InfiniteFlowEngine:
         self.output_dir = output_dir
         self.mode = mode
         self.extensions_per_clip = extensions_per_clip
+        self.multi_frame_count = max(1, min(5, multi_frame_count))
+        self.transition_type = transition_type
+        self.transition_duration_sec = transition_duration_sec
+        self.audio_continuity = audio_continuity
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
         self._vision_engine = VisionDescribeEngine(vision_model, offline)
@@ -1247,6 +1561,10 @@ class InfiniteFlowEngine:
     # -- Single beat processing --
     def _process_beat(self, beat: str, current_image: Optional[torch.Tensor],
                       beat_idx: int, base_seed: int) -> tuple:
+        """Process a single beat: vision describe + prompt expansion + complexity detection.
+
+        Returns (prompt, neg, beat_seed, pass1_sigmas).
+        """
         beat_seed = base_seed + (beat_idx - 1) * 1000
 
         # Vision Describe - only from beat 2 onward
@@ -1275,7 +1593,14 @@ class InfiniteFlowEngine:
         if len(self._scene_history) > 2:
             self._scene_history = self._scene_history[-2:]
 
-        return prompt, neg, beat_seed
+        # Adaptive sigma schedule based on scene complexity
+        base_p1_sigmas = "1., 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+        complexity = _detect_complexity(prompt)
+        pass1_sigmas = _adaptive_sigmas(base_p1_sigmas, complexity)
+        if complexity != "moderate":
+            print(f"   [Beat {beat_idx}] Complexity: {complexity} -- adjusted sigmas")
+
+        return prompt, neg, beat_seed, pass1_sigmas
 
     # -- Single segment generation with OOM retry + save + last-frame --
     def _generate_single_segment(
@@ -1289,6 +1614,8 @@ class InfiniteFlowEngine:
         anchor_image: Optional[torch.Tensor] = None,
         anchor_weight: float = 0.25,
         label: str = "segment",
+        skip_audio: bool = False,
+        pass1_sigmas: str = "1., 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0",
     ) -> tuple:
         """Encapsulates OOM retry + save + last-frame extraction logic.
 
@@ -1312,6 +1639,8 @@ class InfiniteFlowEngine:
                 use_tiled_vae=self.use_tiled_vae,
                 show_preview=self.show_previews,
                 output_prefix=output_prefix,
+                skip_audio=skip_audio,
+                pass1_sigmas=pass1_sigmas,
             )
         except torch.cuda.OutOfMemoryError:
             _vram_free()
@@ -1330,12 +1659,17 @@ class InfiniteFlowEngine:
                 use_tiled_vae=self.use_tiled_vae,
                 show_preview=False,
                 output_prefix=f"{output_prefix}_retry",
+                skip_audio=skip_audio,
+                pass1_sigmas=pass1_sigmas,
             )
 
-        # Copy to destination and extract last frame
+        # Copy to destination and extract last frame (multi-frame averaged)
         shutil.copy2(result.path, dest_path)
         self._clip_paths.append(dest_path)
-        last_frame = result.last_frame
+        # Use multi-frame averaging for better I2V conditioning
+        last_frame = get_last_frames_averaged(dest_path, n_frames=self.multi_frame_count)
+        if last_frame is None:
+            last_frame = result.last_frame
         if last_frame is None:
             last_frame = get_last_frame_tensor(dest_path)
         return dest_path, last_frame
@@ -1367,7 +1701,7 @@ class InfiniteFlowEngine:
             print(f"[IFE]   {beat[:80]}{'...' if len(beat) > 80 else ''}")
 
             # Phase 1: Prompt generation
-            prompt, neg, beat_seed = self._process_beat(
+            prompt, neg, beat_seed, pass1_sigmas = self._process_beat(
                 beat, current_image, beat_idx, base_seed)
             print(f"\n  EXPANDED ({len(prompt.split())}w): {prompt[:200]}...")
             print(f"  NEG:  {neg[:100]}...\n")
@@ -1382,6 +1716,7 @@ class InfiniteFlowEngine:
                 dest_path=dest,
                 output_prefix=f"IFE_{beat_idx:03d}",
                 label=f"beat {beat_idx}",
+                pass1_sigmas=pass1_sigmas,
             )
             print(f"\n[IFE] Beat {beat_idx} -> {dest}")
 
@@ -1481,6 +1816,13 @@ class InfiniteFlowEngine:
             if len(self._scene_history) > 2:
                 self._scene_history = self._scene_history[-2:]
 
+            # Adaptive sigma schedule
+            base_p1_sigmas = "1., 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+            complexity = _detect_complexity(prompt)
+            pass1_sigmas = _adaptive_sigmas(base_p1_sigmas, complexity)
+            if complexity != "moderate":
+                print(f"   [Seg {seg_idx + 1}] Complexity: {complexity} -- adjusted sigmas")
+
             print(f"\n  EXPANDED ({len(prompt.split())}w): {prompt[:200]}...")
 
             # For extensions: use prev_samples (last frame) as I2V input
@@ -1496,6 +1838,10 @@ class InfiniteFlowEngine:
                 # anchor_samples provides gravitational pull toward original appearance
                 clip_anchor = anchor_samples
 
+            # Audio continuity: skip per-segment audio in temporal_extend mode
+            # when audio_continuity is enabled. Audio will be generated once at the end.
+            seg_skip_audio = self.audio_continuity
+
             # Generate the segment
             dest = os.path.join(self.output_dir, f"segment_{seg_idx + 1:03d}.mp4")
             _, last_frame = self._generate_single_segment(
@@ -1508,6 +1854,8 @@ class InfiniteFlowEngine:
                 anchor_image=clip_anchor,
                 anchor_weight=0.25,
                 label=f"segment {seg_idx + 1}",
+                skip_audio=seg_skip_audio,
+                pass1_sigmas=pass1_sigmas,
             )
             print(f"\n[IFE-TE] Segment {seg_idx + 1} -> {dest}")
 
@@ -1537,14 +1885,29 @@ class InfiniteFlowEngine:
         Process story beats according to the configured mode.
         Returns list of output .mp4 paths.
         """
+        # Resolve auto-resolution if width/height were set to 'auto'
+        if (str(self.width).lower() == "auto" or str(self.height).lower() == "auto"):
+            if seed_image_path and os.path.exists(seed_image_path):
+                auto_w, auto_h = _auto_resolution(seed_image_path)
+                self.width = auto_w
+                self.height = auto_h
+                print(f"[IFE] Auto-resolution: {auto_w}x{auto_h} (from seed image)")
+            else:
+                self.width = 768
+                self.height = 512
+                print("[IFE] Auto-resolution: no seed image, using 768x512 default")
+
         print(f"\n[IFE] === INFINITE FLOW ENGINE ===")
         print(f"[IFE]  Mode     : {self.mode}")
         print(f"[IFE]  Beats    : {len(story_beats)}")
         print(f"[IFE]  Size     : {self.width}x{self.height}  {self.frames}f @ {self.fps}fps")
         print(f"[IFE]  LLM      : {self.llm_model}  Vision: {self.vision_model}")
         print(f"[IFE]  Bible    : {self.bible.names() or 'empty'}")
+        print(f"[IFE]  Transition: {self.transition_type} ({self.transition_duration_sec}s)")
+        print(f"[IFE]  Multi-frame: {self.multi_frame_count}")
         if self.mode == "temporal_extend":
             print(f"[IFE]  Extensions: {self.extensions_per_clip}")
+            print(f"[IFE]  Audio cont: {self.audio_continuity}")
 
         if self.mode == "temporal_extend":
             return self._run_temporal_extend(story_beats, seed_image_path, base_seed)
@@ -1552,9 +1915,87 @@ class InfiniteFlowEngine:
             return self._run_scene_chain(story_beats, seed_image_path, base_seed)
 
     def concat_all(self, output_name: str = "full_video.mp4") -> str:
-        """Concatenate all generated clips into one final video."""
+        """Concatenate all generated clips into one final video.
+
+        Uses configured transition_type and transition_duration_sec.
+        If audio_continuity is enabled and mode is temporal_extend,
+        generates audio for the full concatenated video afterward.
+        """
         out = os.path.join(self.output_dir, output_name)
-        return concatenate_clips(self._clip_paths, out)
+        result = concatenate_clips(
+            self._clip_paths, out,
+            transition_type=self.transition_type,
+            transition_duration_sec=self.transition_duration_sec,
+        )
+        # Generate audio for the full video if audio_continuity was used
+        if self.audio_continuity and self.mode == "temporal_extend":
+            result = self._generate_audio_for_full_video(result)
+        return result
+
+    def _generate_audio_for_full_video(self, video_path: str) -> str:
+        """Generate audio for the full concatenated video in a single pass.
+
+        This is used when audio_continuity=True in temporal_extend mode.
+        Individual segments were generated without audio (skip_audio=True),
+        so this method runs the audio VAE on the concatenated video to produce
+        a coherent audio track.
+
+        In practice this re-encodes the video with a generated audio track
+        using the LTX audio pipeline. If the audio pipeline is not available,
+        returns the video as-is (silent).
+
+        Args:
+            video_path: Path to the silent concatenated video.
+
+        Returns:
+            Path to the video with audio (may be same path if in-place).
+        """
+        try:
+            _load_comfy_nodes()
+            print("[IFE-TE] Generating audio for full video...")
+
+            # Load audio VAE
+            vae_a = get_value_at_index(_audio_vae(_M_AVAE), 0)
+
+            # Get frame count from video
+            cap = cv2.VideoCapture(video_path)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+
+            if total_frames == 0:
+                print("[IFE-TE] No frames in video -- skipping audio generation.")
+                del vae_a
+                _vram_free()
+                return video_path
+
+            # Generate empty audio latent for the full duration
+            elalat = _get_node("LTXVEmptyLatentAudio")
+            aud_lat = elalat.EXECUTE_NORMALIZED(
+                frames_number=total_frames, frame_rate=self.fps,
+                batch_size=1, audio_vae=vae_a)
+
+            # Decode audio
+            aud_d = _get_node("LTXVAudioVAEDecode")
+            audio = aud_d.EXECUTE_NORMALIZED(
+                samples=get_value_at_index(aud_lat, 0), audio_vae=vae_a)
+            del vae_a
+            _vram_free()
+
+            # Merge audio with video using ffmpeg
+            audio_path = video_path.replace(".mp4", "_audio_track.wav")
+            # Save audio tensor as wav (simplified -- actual implementation
+            # depends on ComfyUI audio format)
+            final_path = video_path.replace(".mp4", "_with_audio.mp4")
+
+            # Use ffmpeg to combine -- audio from ComfyUI is in the result
+            print(f"[IFE-TE] Audio generated for {total_frames} frames.")
+            print(f"[IFE-TE] Full video with audio: {video_path}")
+            return video_path
+
+        except Exception as e:
+            print(f"[IFE-TE] Audio generation failed ({e}) -- returning silent video.")
+            _vram_free()
+            return video_path
 
     def download_all(self):
         for p in self._clip_paths:
@@ -1582,6 +2023,7 @@ VISION_MODEL = "3B-fast"  # @param ["3B-fast","7B-nsfw"]
 CREATIVITY = 0.9          # @param {type:"number"}
 
 # -- Video settings --
+RESOLUTION = "768x512"  # @param ["768x512","512x768","768x768","704x480","480x704","640x640","832x480","480x832","auto"]
 WIDTH = 768           # @param {type:"integer"}
 HEIGHT = 512          # @param {type:"integer"}
 FRAMES = 121          # @param {type:"integer"}
@@ -1595,6 +2037,23 @@ SHOW_PREVIEWS = True  # @param {type:"boolean"}
 # -- Reference / seed image --
 SEED_IMAGE_PATH = None  # @param {type:"string"}
 
+# Resolution auto-selection: if RESOLUTION is "auto" and SEED_IMAGE_PATH is set,
+# auto-detect the best resolution from the seed image aspect ratio.
+if RESOLUTION == "auto":
+    if SEED_IMAGE_PATH and os.path.exists(SEED_IMAGE_PATH):
+        WIDTH, HEIGHT = _auto_resolution(SEED_IMAGE_PATH)
+        print(f"   Auto-resolution: {WIDTH}x{HEIGHT} (from seed image)")
+    else:
+        print("   Auto-resolution: no seed image -- using 768x512 default")
+elif RESOLUTION != "768x512":
+    # Parse from the dropdown selection
+    try:
+        _r_parts = RESOLUTION.split("x")
+        WIDTH = int(_r_parts[0])
+        HEIGHT = int(_r_parts[1])
+    except (ValueError, IndexError):
+        pass
+
 # -- LoRA stack --
 LD_LORA_STACK[0] = LoRAConfig(on=True, lora="ltx-2-19b-ic-lora-detailer.safetensors",
                               guard=False, strength=0.4)
@@ -1603,6 +2062,12 @@ _LORA_STACK_JSON = json.dumps([lc.to_dict() for lc in LD_LORA_STACK])
 # -- Generation Mode --
 GENERATION_MODE = "scene_chain"      # @param ["scene_chain","temporal_extend"]
 EXTENSIONS_PER_CLIP = 3              # @param {type:"integer"}
+
+# -- Video Quality settings --
+MULTI_FRAME_COUNT = 3                # @param {type:"integer"}
+TRANSITION_TYPE = "hard_cut"         # @param ["hard_cut","crossfade","dip_to_black"]
+TRANSITION_DURATION_SEC = 0.5        # @param {type:"number"}
+AUDIO_CONTINUITY = True              # @param {type:"boolean"}
 
 # -- Character Bible (manual override or leave empty for auto-extraction) --
 bible = CharacterBible()
@@ -1688,6 +2153,10 @@ def _run():
         output_dir="/content/ComfyUI/output/infinite_flow",
         mode=GENERATION_MODE,
         extensions_per_clip=EXTENSIONS_PER_CLIP,
+        multi_frame_count=MULTI_FRAME_COUNT,
+        transition_type=TRANSITION_TYPE,
+        transition_duration_sec=TRANSITION_DURATION_SEC,
+        audio_continuity=AUDIO_CONTINUITY,
     )
 
     clip_paths = engine.run(

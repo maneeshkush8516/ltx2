@@ -1,0 +1,28 @@
+{
+  "id": "FEAT-002",
+  "type": "feat",
+  "description": "Video Quality & Generation improvements: Multi-frame chaining, transition overlap (crossfade/dip_to_black), adaptive sigma schedule, audio continuity for temporal_extend, and resolution auto-selection.",
+  "status": "in_progress",
+  "steps": [
+    "1. Multi-frame chaining: Replace the current get_last_frame_tensor() single-frame extraction with a new function get_last_frames_averaged(video_path, n_frames=3) that extracts the last 3-5 frames and averages them into a single tensor for I2V conditioning. Keep get_last_frame_tensor() for backward compat but add the new function. Update InfiniteFlowEngine._generate_single_segment() and _run_temporal_extend() to use the averaged frames by default (add a config param multi_frame_count: int = 3 to __init__).",
+    "2. Transition overlap: Replace concatenate_clips() with an enhanced version that supports a transition_type parameter: 'hard_cut' (current ffmpeg -c copy behavior), 'crossfade' (ffmpeg xfade filter with configurable duration), and 'dip_to_black' (xfade=fade with black intermediate). Add transition_type and transition_duration_sec params to InfiniteFlowEngine.__init__() and concat_all(). Default remains 'hard_cut' for backward compat.",
+    "3. Adaptive sigma schedule: Add a function _adaptive_sigmas(base_sigmas: str, complexity: str) that takes a complexity hint ('simple', 'moderate', 'complex') and adjusts the sigma schedule - fewer intermediate steps for 'simple' scenes, more for 'complex'. Add complexity detection in _process_beat() that analyzes the expanded prompt for motion keywords (run, fight, dance, chase = complex; sit, stand, look, wait = simple). Pass the appropriate sigmas to generate_clip.",
+    "4. Audio continuity: In _run_temporal_extend(), add an audio_continuity: bool = True param. When True, generate clips without audio (skip audio latent/decode steps) and then after all segments are generated, run a single audio generation pass on the concatenated video. Add a _generate_audio_for_full_video() method. Implementation: during temporal_extend with audio_continuity=True, pass a new skip_audio=True param to generate_clip() which skips LTXVEmptyLatentAudio and audio decode steps.",
+    "5. Resolution auto-selection: Add a function _auto_resolution(image_path: str) -> tuple[int, int] that reads the seed image aspect ratio and picks the closest supported LTX-2 resolution from a lookup table: [(768, 512), (512, 768), (768, 768), (704, 480), (480, 704), (640, 640), (832, 480), (480, 832)]. Add resolution='auto' support in Cell 4 config that calls this when SEED_IMAGE_PATH is set. In InfiniteFlowEngine.__init__, accept width/height as 'auto' string and resolve at run() time."
+  ],
+  "acceptance_criteria": [
+    "AST parse passes",
+    "get_last_frames_averaged() function exists and returns averaged tensor",
+    "concatenate_clips() supports transition_type parameter with 'hard_cut', 'crossfade', 'dip_to_black'",
+    "_adaptive_sigmas() function exists and returns modified sigma strings",
+    "generate_clip() has skip_audio parameter",
+    "_auto_resolution() function exists and returns resolution tuple",
+    "InfiniteFlowEngine.__init__ has multi_frame_count, transition_type, transition_duration_sec, audio_continuity params"
+  ],
+  "verification": [
+    "python -c \"import ast; ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); print('PASS')\"",
+    "python -c \"import ast; tree=ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); names=[n.name for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef))]; assert 'get_last_frames_averaged' in names; assert '_adaptive_sigmas' in names; assert '_auto_resolution' in names; print('Video quality features present')\""
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

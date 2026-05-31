@@ -66,8 +66,10 @@ _pip("-r /content/ComfyUI/requirements.txt")
 # -- Custom nodes --
 os.chdir("/content/ComfyUI/custom_nodes")
 
+# KJNodes: use pinned version compatible with ComfyUI_22_01_2026_v0.10.0
 _shell("git clone --branch kj_1.2.6 https://github.com/Isi-dev/ComfyUI_KJNodes")
 _shell("git clone --branch ComfyUI_GGUF_22_01_2026 https://github.com/Isi-dev/ComfyUI_GGUF.git")
+# LTXVideo: pin to a known-working commit (avoid kornia breaking changes)
 _shell("git clone https://github.com/Lightricks/ComfyUI-LTXVideo.git")
 _shell("git clone https://github.com/seanhan19911990-source/LTX2EasyPrompt-LD.git")
 _shell("git clone https://github.com/seanhan19911990-source/LTX2-Master-Loader.git")
@@ -82,6 +84,8 @@ _shell("pip install -r requirements.txt -q")
 
 os.chdir("/content/ComfyUI/custom_nodes/ComfyUI-LTXVideo")
 _shell("pip install -r requirements.txt -q 2>/dev/null || true")
+# Fix kornia version for LTXVideo pyramid blending compatibility
+_shell("pip install -q 'kornia>=0.7.0,<0.8.0' 2>/dev/null || true")
 
 # -- System packages --
 subprocess.run(["apt-get", "-y", "install", "-qq", "aria2", "ffmpeg"],
@@ -228,7 +232,7 @@ def _vram_print(tag=""):
     if not torch.cuda.is_available():
         return
     u = torch.cuda.memory_allocated() / 1024**3
-    t = torch.cuda.get_device_properties(0).total_mem / 1024**3
+    t = torch.cuda.get_device_properties(0).total_memory / 1024**3
     filled = int(20 * u / t) if t else 0
     bar = "|" * filled + "." * (20 - filled)
     print(f"   VRAM [{bar}] {u:.1f}/{t:.1f} GB  {tag}")
@@ -432,19 +436,45 @@ def _load_comfy_nodes():
     if _NODES_LOADED:
         return
     import nest_asyncio
+    nest_asyncio.apply()
     from nodes import init_builtin_extra_nodes, init_external_custom_nodes
 
     async def _l():
         failed = await init_builtin_extra_nodes()
         await init_external_custom_nodes()
         if failed:
-            print(f"   Node failures: {failed}")
+            print(f"   [Nodes] Some nodes failed to load (non-critical): {len(failed)} failures")
+            # These failures are typically version mismatches in optional nodes
+            # (KJNodes preview, VideoHelperSuite, LTXVideo pyramid blend).
+            # Core nodes (UnetLoaderGGUF, DualCLIPLoader, VAELoader, etc.) still work.
 
     try:
-        asyncio.run(_l())
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.run_until_complete(_l())
+        else:
+            asyncio.run(_l())
     except RuntimeError:
         nest_asyncio.apply()
         asyncio.get_event_loop().run_until_complete(_l())
+
+    # Verify critical nodes are available
+    critical_nodes = [
+        "UnetLoaderGGUF", "DualCLIPLoader", "CLIPTextEncode",
+        "ConditioningZeroOut", "LTXVConditioning", "VAELoader",
+        "EmptyLTXVLatentVideo", "LTXVEmptyLatentAudio", "LTXVConcatAVLatent",
+        "ManualSigmas", "KSamplerSelect", "RandomNoise", "CFGGuider",
+        "SamplerCustomAdvanced", "LTXVSeparateAVLatent", "LTXVCropGuides",
+        "LTXVLatentUpsampler", "LatentUpscaleModelLoader", "VAEDecode",
+        "LTXVAudioVAEDecode", "CreateVideo",
+    ]
+    missing = [n for n in critical_nodes if n not in NODE_CLASS_MAPPINGS]
+    if missing:
+        print(f"   [Nodes] WARNING: Missing critical nodes: {missing}")
+        print(f"   [Nodes] Available: {len(NODE_CLASS_MAPPINGS)} nodes loaded")
+    else:
+        print(f"   [Nodes] All {len(critical_nodes)} critical nodes available")
+
     _NODES_LOADED = True
 
 

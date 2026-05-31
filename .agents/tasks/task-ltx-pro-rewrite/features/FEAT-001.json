@@ -1,0 +1,41 @@
+{
+  "id": "FEAT-001",
+  "type": "feat",
+  "description": "Complete rewrite of /projects/sandbox/ltx2/LTX.PY as a professional, comprehensive video generation pipeline. This single feature encompasses all user requirements: (1) SVI-Pro temporal extension with OVERLAP_FRAMES, (2) enhanced character consistency with anchor blending and bible enforcement, (3) I2V re-conditioning in Pass 2 (from LD-I2V.json pattern), (4) merged Easy Prompt logic with story-to-prompt workflow, (5) T4 GPU memory optimization, (6) voice sync/audio foundation hooks, and (7) story analysis workflow (environment analysis, character profiling, scene-by-scene prompt generation).",
+  "status": "in_progress",
+  "steps": [
+    "Read and understand the existing LTX.PY structure (~1750 lines across 5 cells/sections)",
+    "Create a completely rewritten LTX.PY file that preserves the same 5-section architecture (A: VisionDescribe, B: EasyPrompt, C: CharacterBible, D: generate_clip, E: InfiniteFlowEngine) but with major enhancements",
+    "CELL 1 (Environment Setup): Clean up duplicate install blocks. Use subprocess-based _shell()/_pip() helpers only (no ! or % magic). Keep all the same repos/nodes but deduplicate.",
+    "CELL 2 (Model Downloads): Keep the same download logic with aria2c. No changes needed.",
+    "CELL 3 (Core Imports): Add OVERLAP_FRAMES constant (default 16), ANCHOR_STRENGTH_HIGH/LOW, USE_ADAPTIVE_STRENGTH, add overlap frame extraction helper (extract_overlap_frames() using cv2 to get last N frames as tensor batch), add blend_anchor_with_prev() helper.",
+    "SECTION A (VisionDescribeEngine): Keep existing logic. Add a describe_for_bible() method that extracts character-specific attributes (face, hair, clothing, build, skin tone) from the description for structured bible entries.",
+    "SECTION B (EasyPromptEngine): Merge the story-to-prompt workflow. Add methods: analyze_story(story_text) -> returns environment dict + character list, extract_characters(story_text) -> structured CharacterBible entries, generate_scene_prompts(scenes_list, bible, environment) -> list of (positive, negative) tuples. Enhance the SYSTEM_PROMPT to handle motion/camera/action guidance. Add camera direction mapping (dolly_forward -> prose description). Keep the existing generate() method intact.",
+    "SECTION C (CharacterBible): Enhance with add_from_json(character_dict) to accept the PRO v2 style detailed_appearance dict. Add consistency_prefix() method that returns the CHARACTER CONSISTENCY CRITICAL prompt block (from PRO v2's get_character_consistency_prefix pattern). Add lock_attributes() and validate_against_description() for drift detection.",
+    "SECTION D (generate_clip): KEY CHANGES: (1) Add overlap_frames parameter to support SVI-Pro extension, (2) Implement I2V re-conditioning in Pass 2 (from LD-I2V.json: after upscale, re-apply LTXVImgToVideoInplace with the reference image before the second sampling), (3) Add PurgeVRAM calls between passes, (4) Enhanced ManualSigmas for Pass 1 (10-step) and Pass 2 (keep existing 4-step), (5) Add SageAttention optimization comment/hook, (6) anchor_image blending with OVERLAP_FRAMES worth of frames (not just last frame), (7) Add prev_clip_path parameter for extracting overlap frames directly.",
+    "SECTION E (InfiniteFlowEngine): Major expansion: (1) Add SVI-Pro mode (svi_pro_extend) as third mode alongside scene_chain and temporal_extend - this uses overlap frames properly with anchor_samples maintained throughout. (2) Implement proper overlap frame extraction (last OVERLAP_FRAMES frames from video as conditioning, not just last frame). (3) Add adaptive anchor strength calculation (from PRO v2). (4) Add story-to-prompt workflow integration: new run_from_story() method that takes raw story text, calls EasyPromptEngine.analyze_story(), builds bible, generates per-scene prompts, then generates clips. (5) Add voice_sync foundation: VoiceSyncHook class with placeholder methods for future audio sync integration.",
+    "CELL 4 (Configuration): Add new config options: OVERLAP_FRAMES, ANCHOR_STRENGTH_HIGH, ANCHOR_STRENGTH_LOW, USE_ADAPTIVE_STRENGTH, GENERATION_MODE options now include 'svi_pro_extend'. Add STORY_TEXT multiline input option as alternative to STORY_BEATS.",
+    "CELL 5 (Run): Update _run() to support both STORY_BEATS and STORY_TEXT input modes. Add the story analysis -> prompt generation -> clip generation pipeline.",
+    "Throughout: Add clear section headers, inline comments explaining each technique, and a module docstring explaining the architecture. Remove all emoji from code. Remove all Colab magic (!, %, %cd). Use subprocess/os.chdir equivalents.",
+    "Throughout: Ensure AST-valid Python (no Colab magic syntax that would break ast.parse)."
+  ],
+  "acceptance_criteria": [
+    "The file /projects/sandbox/ltx2/LTX.PY parses as valid Python via ast.parse() with no errors",
+    "All 5 sections (A-E) plus 5 cells are present with clear headers",
+    "OVERLAP_FRAMES logic is implemented in both generate_clip() and InfiniteFlowEngine",
+    "I2V re-conditioning in Pass 2 is implemented (re-apply LTXVImgToVideoInplace after upscale)",
+    "SVI-Pro extension mode is implemented with proper anchor_samples + prev_samples + overlap",
+    "Story-to-prompt workflow is present (analyze_story, extract_characters, generate_scene_prompts)",
+    "CharacterBible has consistency_prefix() and add_from_json() methods",
+    "VoiceSyncHook class exists with placeholder methods and clear TODO comments",
+    "Memory management: explicit del + _vram_free() after each major model usage",
+    "No Colab magic (!, %, %cd) - all converted to subprocess/os.chdir",
+    "File is well-commented with architecture explanation at top"
+  ],
+  "verification": [
+    "Run: python -c \"import ast; ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); print('AST valid')\"",
+    "Run: python -c \"import ast; tree = ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); classes = [n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]; print(classes); assert 'VisionDescribeEngine' in classes; assert 'EasyPromptEngine' in classes; assert 'CharacterBible' in classes; assert 'InfiniteFlowEngine' in classes; assert 'VoiceSyncHook' in classes; print('All classes present')\""
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

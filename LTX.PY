@@ -398,6 +398,33 @@ def calculate_adaptive_strength(
     return max(ANCHOR_STRENGTH_LOW, min(ANCHOR_STRENGTH_HIGH, strength))
 
 
+def _validate_frame_quality(frame_tensor: torch.Tensor) -> Tuple[bool, float]:
+    """
+    Validate frame quality via brightness and sharpness checks.
+    Returns (is_valid, quality_score).
+    """
+    if frame_tensor is None:
+        return False, 0.0
+    # Convert to numpy grayscale for analysis
+    if frame_tensor.ndim == 4:
+        frame_tensor = frame_tensor[0]
+    frame_np = (frame_tensor.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+    gray = cv2.cvtColor(frame_np, cv2.COLOR_RGB2GRAY)
+
+    # Brightness check
+    mean_brightness = gray.mean()
+    if mean_brightness < 10 or mean_brightness > 245:
+        return False, mean_brightness
+
+    # Sharpness check (Laplacian variance)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if laplacian_var < 50:
+        return False, laplacian_var
+
+    score = (laplacian_var / 100.0) * (1.0 - abs(mean_brightness - 128) / 128.0)
+    return True, score
+
+
 # ======================================================================
 # Video Helpers
 # ======================================================================
@@ -1823,6 +1850,54 @@ class InfiniteFlowEngine:
     def _rolling_ctx(self) -> str:
         return "\n".join(self._scene_history[-2:])
 
+    def _save_checkpoint(self, completed_indices: List[int], clip_paths: List[str],
+                         current_image: Optional[torch.Tensor]):
+        """Save generation progress for resume capability."""
+        checkpoint = {
+            "completed_indices": completed_indices,
+            "clip_paths": clip_paths,
+            "bible_state": self.bible._chars,
+            "scene_history": self._scene_history,
+        }
+        # Save current frame as PNG for resume
+        if current_image is not None:
+            frame_path = os.path.join(self.output_dir, "checkpoint_frame.png")
+            img = tensor_to_pil(current_image)
+            img.save(frame_path)
+            checkpoint["current_image_path"] = frame_path
+
+        ckpt_path = os.path.join(self.output_dir, "checkpoint.json")
+        with open(ckpt_path, "w") as f:
+            json.dump(checkpoint, f, indent=2)
+        print(f"   [Checkpoint] Saved at index {completed_indices[-1] if completed_indices else 0}")
+
+    def _load_checkpoint(self) -> Optional[Tuple[List[int], List[str], Optional[torch.Tensor]]]:
+        """Load checkpoint if available. Returns (completed_indices, clip_paths, current_image) or None."""
+        ckpt_path = os.path.join(self.output_dir, "checkpoint.json")
+        if not os.path.exists(ckpt_path):
+            return None
+        try:
+            with open(ckpt_path) as f:
+                checkpoint = json.load(f)
+            completed = checkpoint.get("completed_indices", [])
+            paths = checkpoint.get("clip_paths", [])
+            # Verify clip files still exist
+            paths = [p for p in paths if os.path.exists(p)]
+            # Restore bible state
+            if "bible_state" in checkpoint:
+                self.bible._chars = checkpoint["bible_state"]
+            if "scene_history" in checkpoint:
+                self._scene_history = checkpoint["scene_history"]
+            # Load current image
+            current_image = None
+            if "current_image_path" in checkpoint:
+                current_image = load_image_tensor(checkpoint["current_image_path"])
+            print(f"   [Checkpoint] Resumed from index {completed[-1] if completed else 0} ({len(paths)} clips)")
+            return completed, paths, current_image
+        except (json.JSONDecodeError, KeyError, OSError) as e:
+            print(f"   [Checkpoint] Failed to load: {e}")
+            return None
+
     # -- Single beat processing --
     def _process_beat(self, beat: str, current_image: Optional[torch.Tensor],
                       beat_idx: int, base_seed: int) -> Tuple[str, str, int, Optional[str]]:
@@ -1868,6 +1943,7 @@ class InfiniteFlowEngine:
         base_seed: int = 42,
         pre_expanded: bool = False,
         beat_negatives: Optional[List[str]] = None,
+        resume: bool = True,
     ) -> List[str]:
         """Generate separate clips per story beat, chain via last-frame extraction."""
         current_image: Optional[torch.Tensor] = None
@@ -1882,10 +1958,25 @@ class InfiniteFlowEngine:
                 self.bible.extract_from_description("Main Character", desc)
                 self._scene_history.append(desc)
 
+        # Resume from checkpoint if available
+        start_idx = 0
+        if resume:
+            ckpt = self._load_checkpoint()
+            if ckpt is not None:
+                completed_indices, self._clip_paths, resumed_image = ckpt
+                if resumed_image is not None:
+                    current_image = resumed_image
+                start_idx = len(completed_indices)
+                print(f"[IFE] Resuming from segment {start_idx + 1}")
+
         self._prompt_engine._load()
         self._prompt_engine.keep_loaded = True
 
-        for beat_idx, beat in enumerate(story_beats, 1):
+        for beat_idx_raw, beat in enumerate(story_beats, 1):
+            beat_idx = beat_idx_raw
+            if beat_idx_raw - 1 < start_idx:
+                continue  # Skip already-completed beats
+
             print(f"\n[IFE] -- Beat {beat_idx}/{len(story_beats)} --")
             print(f"[IFE]   {beat[:80]}{'...' if len(beat) > 80 else ''}")
 
@@ -1905,40 +1996,57 @@ class InfiniteFlowEngine:
                 )
             print(f"\n  EXPANDED ({len(prompt.split())}w): {prompt[:200]}...")
 
-            try:
-                clip_path = generate_clip(
-                    image_tensor=current_image,
-                    prompt=prompt,
-                    neg_prompt=neg,
-                    width=self.width,
-                    height=self.height,
-                    frames=self.frames,
-                    fps=self.fps,
-                    seed=beat_seed,
-                    image_strength=self.img_strength,
-                    use_tiled_vae=self.use_tiled_vae,
-                    show_preview=self.show_previews,
-                    output_prefix=f"IFE_{beat_idx:03d}",
-                    camera_lora=camera_lora,
-                )
-            except torch.cuda.OutOfMemoryError:
-                _vram_free()
-                reduced_frames = max(61, self.frames // 2)
-                print(f"   OOM on beat {beat_idx}. Retrying with {reduced_frames} frames...")
-                clip_path = generate_clip(
-                    image_tensor=None,
-                    prompt=prompt,
-                    neg_prompt=neg,
-                    width=self.width,
-                    height=self.height,
-                    frames=reduced_frames,
-                    fps=self.fps,
-                    seed=beat_seed + 1,
-                    use_tiled_vae=self.use_tiled_vae,
-                    show_preview=False,
-                    output_prefix=f"IFE_{beat_idx:03d}_retry",
-                    camera_lora=camera_lora,
-                )
+            # Quality gate retry loop
+            max_retries = 2
+            for retry_attempt in range(max_retries + 1):
+                try:
+                    clip_path = generate_clip(
+                        image_tensor=current_image,
+                        prompt=prompt,
+                        neg_prompt=neg,
+                        width=self.width,
+                        height=self.height,
+                        frames=self.frames,
+                        fps=self.fps,
+                        seed=beat_seed + retry_attempt,
+                        image_strength=self.img_strength,
+                        use_tiled_vae=self.use_tiled_vae,
+                        show_preview=self.show_previews,
+                        output_prefix=f"IFE_{beat_idx:03d}",
+                        camera_lora=camera_lora,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    _vram_free()
+                    reduced_frames = max(61, self.frames // 2)
+                    print(f"   OOM on beat {beat_idx}. Retrying with {reduced_frames} frames...")
+                    clip_path = generate_clip(
+                        image_tensor=None,
+                        prompt=prompt,
+                        neg_prompt=neg,
+                        width=self.width,
+                        height=self.height,
+                        frames=reduced_frames,
+                        fps=self.fps,
+                        seed=beat_seed + 1,
+                        use_tiled_vae=self.use_tiled_vae,
+                        show_preview=False,
+                        output_prefix=f"IFE_{beat_idx:03d}_retry",
+                        camera_lora=camera_lora,
+                    )
+                    break
+
+                # Validate frame quality
+                last_frame_check = get_last_frame_tensor(clip_path)
+                if last_frame_check is not None:
+                    is_valid, score = _validate_frame_quality(last_frame_check)
+                    if is_valid or retry_attempt == max_retries:
+                        if not is_valid:
+                            print(f"   [Quality] Beat {beat_idx} failed quality check (score={score:.1f}), using anyway after {max_retries} retries")
+                        break
+                    else:
+                        print(f"   [Quality] Beat {beat_idx} retry {retry_attempt + 1}/{max_retries} (score={score:.1f})")
+                else:
+                    break
 
             dest = os.path.join(self.output_dir, f"scene_{beat_idx:03d}.mp4")
             shutil.copy2(clip_path, dest)
@@ -1947,6 +2055,12 @@ class InfiniteFlowEngine:
 
             last_frame = get_last_frame_tensor(dest)
             current_image = last_frame if last_frame is not None else None
+
+            self._save_checkpoint(
+                completed_indices=list(range(beat_idx)),
+                clip_paths=self._clip_paths,
+                current_image=current_image,
+            )
 
             if self.show_previews:
                 display_video(dest)
@@ -1963,6 +2077,7 @@ class InfiniteFlowEngine:
         base_seed: int = 42,
         pre_expanded: bool = False,
         beat_negatives: Optional[List[str]] = None,
+        resume: bool = True,
     ) -> List[str]:
         """
         Generate an initial clip then extend via last-frame I2V conditioning.
@@ -1984,10 +2099,23 @@ class InfiniteFlowEngine:
         total_segments = 1 + self.extensions_per_clip
         print(f"\n[IFE-TE] TEMPORAL EXTEND MODE: {total_segments} segments")
 
+        # Resume from checkpoint if available
+        start_idx = 0
+        if resume:
+            ckpt = self._load_checkpoint()
+            if ckpt is not None:
+                completed_indices, self._clip_paths, resumed_image = ckpt
+                if resumed_image is not None:
+                    current_image = resumed_image
+                start_idx = len(completed_indices)
+                print(f"[IFE-TE] Resuming from segment {start_idx + 1}")
+
         self._prompt_engine._load()
         self._prompt_engine.keep_loaded = True
 
         for seg_idx in range(total_segments):
+            if seg_idx < start_idx:
+                continue  # Skip already-completed segments
             is_initial = (seg_idx == 0)
             seg_seed = base_seed + seg_idx * 1000
 
@@ -2034,39 +2162,56 @@ class InfiniteFlowEngine:
                 conditioning_image = current_image
                 clip_anchor = anchor_samples
 
-            try:
-                clip_path = generate_clip(
-                    image_tensor=conditioning_image,
-                    prompt=prompt,
-                    neg_prompt=neg,
-                    width=self.width,
-                    height=self.height,
-                    frames=self.frames,
-                    fps=self.fps,
-                    seed=seg_seed,
-                    image_strength=self.img_strength,
-                    anchor_image=clip_anchor,
-                    anchor_weight=0.25,
-                    use_tiled_vae=self.use_tiled_vae,
-                    show_preview=self.show_previews,
-                    output_prefix=f"IFE_TE_{seg_idx + 1:03d}",
-                )
-            except torch.cuda.OutOfMemoryError:
-                _vram_free()
-                reduced_frames = max(61, self.frames // 2)
-                clip_path = generate_clip(
-                    image_tensor=None,
-                    prompt=prompt,
-                    neg_prompt=neg,
-                    width=self.width,
-                    height=self.height,
-                    frames=reduced_frames,
-                    fps=self.fps,
-                    seed=seg_seed + 1,
-                    use_tiled_vae=self.use_tiled_vae,
-                    show_preview=False,
-                    output_prefix=f"IFE_TE_{seg_idx + 1:03d}_retry",
-                )
+            # Quality gate retry loop
+            max_retries = 2
+            for retry_attempt in range(max_retries + 1):
+                try:
+                    clip_path = generate_clip(
+                        image_tensor=conditioning_image,
+                        prompt=prompt,
+                        neg_prompt=neg,
+                        width=self.width,
+                        height=self.height,
+                        frames=self.frames,
+                        fps=self.fps,
+                        seed=seg_seed + retry_attempt,
+                        image_strength=self.img_strength,
+                        anchor_image=clip_anchor,
+                        anchor_weight=0.25,
+                        use_tiled_vae=self.use_tiled_vae,
+                        show_preview=self.show_previews,
+                        output_prefix=f"IFE_TE_{seg_idx + 1:03d}",
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    _vram_free()
+                    reduced_frames = max(61, self.frames // 2)
+                    clip_path = generate_clip(
+                        image_tensor=None,
+                        prompt=prompt,
+                        neg_prompt=neg,
+                        width=self.width,
+                        height=self.height,
+                        frames=reduced_frames,
+                        fps=self.fps,
+                        seed=seg_seed + 1,
+                        use_tiled_vae=self.use_tiled_vae,
+                        show_preview=False,
+                        output_prefix=f"IFE_TE_{seg_idx + 1:03d}_retry",
+                    )
+                    break
+
+                # Validate frame quality
+                last_frame_check = get_last_frame_tensor(clip_path)
+                if last_frame_check is not None:
+                    is_valid, score = _validate_frame_quality(last_frame_check)
+                    if is_valid or retry_attempt == max_retries:
+                        if not is_valid:
+                            print(f"   [Quality] Segment {seg_idx + 1} failed quality check (score={score:.1f}), using anyway after {max_retries} retries")
+                        break
+                    else:
+                        print(f"   [Quality] Segment {seg_idx + 1} retry {retry_attempt + 1}/{max_retries} (score={score:.1f})")
+                else:
+                    break
 
             dest = os.path.join(self.output_dir, f"segment_{seg_idx + 1:03d}.mp4")
             shutil.copy2(clip_path, dest)
@@ -2085,6 +2230,12 @@ class InfiniteFlowEngine:
             else:
                 current_image = anchor_samples
 
+            self._save_checkpoint(
+                completed_indices=list(range(seg_idx + 1)),
+                clip_paths=self._clip_paths,
+                current_image=current_image,
+            )
+
             if self.show_previews:
                 display_video(dest)
 
@@ -2100,6 +2251,7 @@ class InfiniteFlowEngine:
         base_seed: int = 42,
         pre_expanded: bool = False,
         beat_negatives: Optional[List[str]] = None,
+        resume: bool = True,
     ) -> List[str]:
         """
         Proper SVI-Pro temporal extension mode:
@@ -2131,10 +2283,23 @@ class InfiniteFlowEngine:
         print(f"[IFE-SVI]  Segments: {total_segments}")
         print(f"[IFE-SVI]  Adaptive strength: {USE_ADAPTIVE_STRENGTH}")
 
+        # Resume from checkpoint if available
+        start_idx = 0
+        if resume:
+            ckpt = self._load_checkpoint()
+            if ckpt is not None:
+                completed_indices, self._clip_paths, resumed_image = ckpt
+                if resumed_image is not None:
+                    current_image = resumed_image
+                start_idx = len(completed_indices)
+                print(f"[IFE-SVI] Resuming from segment {start_idx + 1}")
+
         self._prompt_engine._load()
         self._prompt_engine.keep_loaded = True
 
         for seg_idx in range(total_segments):
+            if seg_idx < start_idx:
+                continue  # Skip already-completed segments
             is_initial = (seg_idx == 0)
             seg_seed = base_seed + seg_idx * 1000
 
@@ -2217,44 +2382,61 @@ class InfiniteFlowEngine:
                 clip_anchor = anchor_samples
                 clip_anchor_weight = anchor_strength
 
-            try:
-                clip_path = generate_clip(
-                    image_tensor=clip_image,
-                    prompt=prompt,
-                    neg_prompt=neg,
-                    width=self.width,
-                    height=self.height,
-                    frames=self.frames,
-                    fps=self.fps,
-                    seed=seg_seed,
-                    image_strength=self.img_strength,
-                    anchor_image=clip_anchor,
-                    anchor_weight=clip_anchor_weight,
-                    overlap_frames=OVERLAP_FRAMES if not is_initial else 0,
-                    prev_clip_path=prev_clip_path if not is_initial else None,
-                    use_tiled_vae=self.use_tiled_vae,
-                    show_preview=self.show_previews,
-                    output_prefix=f"IFE_SVI_{seg_idx + 1:03d}",
-                )
-                prev_success = True
-            except torch.cuda.OutOfMemoryError:
-                _vram_free()
-                reduced_frames = max(61, self.frames // 2)
-                print(f"   OOM on segment {seg_idx + 1}. Retrying with {reduced_frames} frames...")
-                clip_path = generate_clip(
-                    image_tensor=None,
-                    prompt=prompt,
-                    neg_prompt=neg,
-                    width=self.width,
-                    height=self.height,
-                    frames=reduced_frames,
-                    fps=self.fps,
-                    seed=seg_seed + 1,
-                    use_tiled_vae=self.use_tiled_vae,
-                    show_preview=False,
-                    output_prefix=f"IFE_SVI_{seg_idx + 1:03d}_retry",
-                )
-                prev_success = False
+            # Quality gate retry loop
+            max_retries = 2
+            for retry_attempt in range(max_retries + 1):
+                try:
+                    clip_path = generate_clip(
+                        image_tensor=clip_image,
+                        prompt=prompt,
+                        neg_prompt=neg,
+                        width=self.width,
+                        height=self.height,
+                        frames=self.frames,
+                        fps=self.fps,
+                        seed=seg_seed + retry_attempt,
+                        image_strength=self.img_strength,
+                        anchor_image=clip_anchor,
+                        anchor_weight=clip_anchor_weight,
+                        overlap_frames=OVERLAP_FRAMES if not is_initial else 0,
+                        prev_clip_path=prev_clip_path if not is_initial else None,
+                        use_tiled_vae=self.use_tiled_vae,
+                        show_preview=self.show_previews,
+                        output_prefix=f"IFE_SVI_{seg_idx + 1:03d}",
+                    )
+                    prev_success = True
+                except torch.cuda.OutOfMemoryError:
+                    _vram_free()
+                    reduced_frames = max(61, self.frames // 2)
+                    print(f"   OOM on segment {seg_idx + 1}. Retrying with {reduced_frames} frames...")
+                    clip_path = generate_clip(
+                        image_tensor=None,
+                        prompt=prompt,
+                        neg_prompt=neg,
+                        width=self.width,
+                        height=self.height,
+                        frames=reduced_frames,
+                        fps=self.fps,
+                        seed=seg_seed + 1,
+                        use_tiled_vae=self.use_tiled_vae,
+                        show_preview=False,
+                        output_prefix=f"IFE_SVI_{seg_idx + 1:03d}_retry",
+                    )
+                    prev_success = False
+                    break
+
+                # Validate frame quality
+                last_frame_check = get_last_frame_tensor(clip_path)
+                if last_frame_check is not None:
+                    is_valid, score = _validate_frame_quality(last_frame_check)
+                    if is_valid or retry_attempt == max_retries:
+                        if not is_valid:
+                            print(f"   [Quality] Segment {seg_idx + 1} failed quality check (score={score:.1f}), using anyway after {max_retries} retries")
+                        break
+                    else:
+                        print(f"   [Quality] Segment {seg_idx + 1} retry {retry_attempt + 1}/{max_retries} (score={score:.1f})")
+                else:
+                    break
 
             dest = os.path.join(self.output_dir, f"svi_segment_{seg_idx + 1:03d}.mp4")
             shutil.copy2(clip_path, dest)
@@ -2270,6 +2452,12 @@ class InfiniteFlowEngine:
                     print(f"[IFE-SVI]   Self-bootstrapped anchor from first clip (frame at 33%)")
 
             print(f"[IFE-SVI] Segment {seg_idx + 1} -> {dest}")
+
+            self._save_checkpoint(
+                completed_indices=list(range(seg_idx + 1)),
+                clip_paths=self._clip_paths,
+                current_image=current_image,
+            )
 
             if self.show_previews:
                 display_video(dest)
@@ -2344,6 +2532,7 @@ class InfiniteFlowEngine:
         base_seed: int = 42,
         pre_expanded: bool = False,
         beat_negatives: Optional[List[str]] = None,
+        resume: bool = True,
     ) -> List[str]:
         """
         Process story beats according to the configured mode.
@@ -2361,11 +2550,11 @@ class InfiniteFlowEngine:
             print(f"[IFE]  Overlap   : {OVERLAP_FRAMES} frames")
 
         if self.mode == "svi_pro_extend":
-            return self._run_svi_pro_extend(story_beats, seed_image_path, base_seed, pre_expanded, beat_negatives)
+            return self._run_svi_pro_extend(story_beats, seed_image_path, base_seed, pre_expanded, beat_negatives, resume)
         elif self.mode == "temporal_extend":
-            return self._run_temporal_extend(story_beats, seed_image_path, base_seed, pre_expanded, beat_negatives)
+            return self._run_temporal_extend(story_beats, seed_image_path, base_seed, pre_expanded, beat_negatives, resume)
         else:
-            return self._run_scene_chain(story_beats, seed_image_path, base_seed, pre_expanded, beat_negatives)
+            return self._run_scene_chain(story_beats, seed_image_path, base_seed, pre_expanded, beat_negatives, resume)
 
     def concat_all(self, output_name: str = "full_video.mp4") -> str:
         """Concatenate all generated clips into one final video."""
@@ -2422,6 +2611,72 @@ class InfiniteFlowEngine:
             check=True, capture_output=True,
         )
         print(f"   Concatenated (overlap-trimmed) -> {out}")
+        return out
+
+    def concat_with_crossfade(self, output_name: str = "full_video_crossfade.mp4",
+                              duration: float = 0.5) -> str:
+        """
+        Concatenate clips with crossfade transitions using ffmpeg xfade filter.
+        Duration is the crossfade length in seconds.
+        """
+        if not self._clip_paths:
+            return ""
+        if len(self._clip_paths) == 1:
+            out = os.path.join(self.output_dir, output_name)
+            shutil.copy2(self._clip_paths[0], out)
+            return out
+
+        out = os.path.join(self.output_dir, output_name)
+
+        # Build ffmpeg complex filter for xfade between clips
+        inputs = []
+        for p in self._clip_paths:
+            inputs.extend(["-i", p])
+
+        n = len(self._clip_paths)
+        # Get durations of each clip for offset calculation
+        durations = []
+        for p in self._clip_paths:
+            try:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries",
+                     "format=duration", "-of", "csv=p=0", p],
+                    capture_output=True, text=True, check=True,
+                )
+                durations.append(float(probe.stdout.strip()))
+            except (subprocess.CalledProcessError, ValueError):
+                durations.append(self.frames / self.fps)
+
+        # Build xfade filter chain
+        if n == 2:
+            offset = durations[0] - duration
+            filter_str = f"[0:v][1:v]xfade=transition=fade:duration={duration}:offset={offset}[v]"
+            cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", filter_str, "-map", "[v]", "-c:v", "libx264", "-preset", "fast", out]
+        else:
+            # Multi-clip xfade chain
+            filter_parts = []
+            cumulative_offset = 0
+            for i in range(n - 1):
+                cumulative_offset += durations[i] - duration if i > 0 else durations[i] - duration
+                if i == 0:
+                    offset = durations[0] - duration
+                    filter_parts.append(f"[0:v][1:v]xfade=transition=fade:duration={duration}:offset={offset}[xf{i}]")
+                elif i < n - 2:
+                    offset = cumulative_offset
+                    filter_parts.append(f"[xf{i-1}][{i+1}:v]xfade=transition=fade:duration={duration}:offset={offset}[xf{i}]")
+                else:
+                    offset = cumulative_offset
+                    filter_parts.append(f"[xf{i-1}][{i+1}:v]xfade=transition=fade:duration={duration}:offset={offset}[v]")
+            filter_str = ";".join(filter_parts)
+            cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", filter_str, "-map", "[v]", "-c:v", "libx264", "-preset", "fast", out]
+
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            print(f"   Concatenated (crossfade {duration}s) -> {out}")
+        except subprocess.CalledProcessError as e:
+            print(f"   [Crossfade] ffmpeg failed ({e.stderr[-200:] if e.stderr else 'unknown'}), falling back to hard-cut")
+            return self.concat_all(output_name)
+
         return out
 
     def download_all(self):
@@ -2714,7 +2969,7 @@ def _run():
         elif GENERATION_MODE == "temporal_extend":
             final = engine.concat_all("extended_final.mp4")
         else:
-            final = engine.concat_all("scene_chain_final.mp4")
+            final = engine.concat_with_crossfade("scene_chain_final.mp4")
         print(f"\n Final video: {final}")
         if SHOW_PREVIEWS:
             display_video(final)

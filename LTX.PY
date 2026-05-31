@@ -204,6 +204,121 @@ os.makedirs(LR_D, exist_ok=True)
 for name, url in _LORA_URLS.items():
     _dl(url, LR_D)
 
+# -- LLM Models (for EasyPromptEngine - optional, download only if needed) --
+_LLM_DOWNLOAD_URLS = {
+    "3B": "https://huggingface.co/huihui-ai/Llama-3.2-3B-Instruct-abliterated",
+    "8B": "https://huggingface.co/mlabonne/NeuralDaredevil-8B-abliterated",
+}
+LLM_MODELS_DIR = "/content/ComfyUI/models/llm"
+
+def download_llm_model(model_size: str = "3B", target_dir: str = LLM_MODELS_DIR) -> str:
+    """Download an LLM model for EasyPromptEngine using huggingface_hub snapshot_download.
+    
+    Uses aria2c-accelerated download via huggingface_hub for fast parallel fetching.
+    Skips if model is already cached locally.
+    
+    Args:
+        model_size: One of "3B", "8B", "14B". 
+        target_dir: Base directory to store downloaded models.
+        
+    Returns:
+        Local path to the downloaded model directory.
+    """
+    from huggingface_hub import snapshot_download
+    
+    model_ids = {
+        "3B": "huihui-ai/Llama-3.2-3B-Instruct-abliterated",
+        "8B": "mlabonne/NeuralDaredevil-8B-abliterated",
+        "14B": "huihui-ai/Huihui-Qwen3-14B-abliterated-v2",
+    }
+    
+    if model_size not in model_ids:
+        print(f"   Unknown LLM model size: {model_size}. Available: {list(model_ids.keys())}")
+        return ""
+    
+    hf_id = model_ids[model_size]
+    local_dir = os.path.join(target_dir, model_size)
+    
+    # Check if already downloaded
+    if os.path.isdir(local_dir) and any(f.endswith(('.safetensors', '.bin', '.gguf')) 
+                                         for f in os.listdir(local_dir) if os.path.isfile(os.path.join(local_dir, f))):
+        print(f"   LLM {model_size} already cached at {local_dir}")
+        return local_dir
+    
+    print(f"   Downloading LLM {model_size} ({hf_id})...")
+    print(f"   This may take 5-15 minutes depending on model size and connection speed.")
+    
+    Path(local_dir).mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # Use snapshot_download with max_workers for parallel download
+        path = snapshot_download(
+            hf_id,
+            local_dir=local_dir,
+            local_dir_use_symlinks=False,
+            resume_download=True,
+            max_workers=8,  # Parallel file downloads
+        )
+        print(f"   LLM {model_size} downloaded to: {path}")
+        return path
+    except Exception as e:
+        print(f"   LLM download failed: {e}")
+        print(f"   You can manually download from: https://huggingface.co/{hf_id}")
+        return ""
+
+
+def download_vision_model(model_key: str = "3B-fast", target_dir: str = LLM_MODELS_DIR) -> str:
+    """Download a Vision model for VisionDescribeEngine using huggingface_hub.
+    
+    Args:
+        model_key: One of "3B-fast", "7B-nsfw".
+        target_dir: Base directory to store downloaded models.
+        
+    Returns:
+        Local path to the downloaded model directory.
+    """
+    from huggingface_hub import snapshot_download
+    
+    model_ids = {
+        "3B-fast": "huihui-ai/Qwen2.5-VL-3B-Instruct-abliterated",
+        "7B-nsfw": "prithivMLmods/Qwen2.5-VL-7B-Abliterated-Caption-it",
+    }
+    
+    if model_key not in model_ids:
+        print(f"   Unknown Vision model: {model_key}. Available: {list(model_ids.keys())}")
+        return ""
+    
+    hf_id = model_ids[model_key]
+    local_dir = os.path.join(target_dir, f"vision_{model_key}")
+    
+    # Check if already downloaded
+    if os.path.isdir(local_dir) and any(f.endswith(('.safetensors', '.bin')) 
+                                         for f in os.listdir(local_dir) if os.path.isfile(os.path.join(local_dir, f))):
+        print(f"   Vision {model_key} already cached at {local_dir}")
+        return local_dir
+    
+    print(f"   Downloading Vision model {model_key} ({hf_id})...")
+    
+    Path(local_dir).mkdir(parents=True, exist_ok=True)
+    
+    try:
+        path = snapshot_download(
+            hf_id,
+            local_dir=local_dir,
+            local_dir_use_symlinks=False,
+            resume_download=True,
+            max_workers=8,
+        )
+        print(f"   Vision {model_key} downloaded to: {path}")
+        return path
+    except Exception as e:
+        print(f"   Vision download failed: {e}")
+        return ""
+
+print("\nLLM/Vision download helpers ready.")
+print("   Use: download_llm_model('3B') or download_llm_model('8B')")
+print("   Use: download_vision_model('3B-fast')")
+
 print("\nAll models ready.")
 
 
@@ -1279,12 +1394,29 @@ class VisionDescribeEngine:
             processor = self._processor
         else:
             hf_id = self.MODEL_OPTIONS[self.model_key]
-            if not self.offline:
+            # Check for offline path override (global config)
+            _offline_vpath = globals().get("OFFLINE_VISION_PATH", "")
+            if _offline_vpath and os.path.isdir(_offline_vpath):
+                source = _offline_vpath
+                print(f"   [VisionDescribe] Using OFFLINE_VISION_PATH: {source}")
+                self.offline = True
+            elif not self.offline:
                 os.environ.pop("TRANSFORMERS_OFFLINE", None)
-                try:
-                    source = snapshot_download(hf_id)
-                except Exception:
-                    source = hf_id
+                # Try pre-downloaded local cache first (from download_vision_model)
+                _local_v = os.path.join(
+                    globals().get("LLM_MODELS_DIR", "/content/ComfyUI/models/llm"),
+                    f"vision_{self.model_key}")
+                if os.path.isdir(_local_v) and any(
+                        f.endswith((".safetensors", ".bin"))
+                        for f in os.listdir(_local_v)
+                        if os.path.isfile(os.path.join(_local_v, f))):
+                    source = _local_v
+                    print(f"   [VisionDescribe] Using pre-downloaded local: {source}")
+                else:
+                    try:
+                        source = snapshot_download(hf_id, max_workers=8, resume_download=True)
+                    except Exception:
+                        source = hf_id
             else:
                 os.environ["TRANSFORMERS_OFFLINE"] = "1"
                 source = hf_id
@@ -1368,12 +1500,28 @@ class VisionDescribeEngine:
             processor = self._processor
         else:
             hf_id = self.MODEL_OPTIONS[self.model_key]
-            if not self.offline:
+            # Check for offline path override (global config)
+            _offline_vpath = globals().get("OFFLINE_VISION_PATH", "")
+            if _offline_vpath and os.path.isdir(_offline_vpath):
+                source = _offline_vpath
+                print(f"   [VisionDescribe] Using OFFLINE_VISION_PATH: {source}")
+                self.offline = True
+            elif not self.offline:
                 os.environ.pop("TRANSFORMERS_OFFLINE", None)
-                try:
-                    source = snapshot_download(hf_id)
-                except Exception:
-                    source = hf_id
+                _local_v = os.path.join(
+                    globals().get("LLM_MODELS_DIR", "/content/ComfyUI/models/llm"),
+                    f"vision_{self.model_key}")
+                if os.path.isdir(_local_v) and any(
+                        f.endswith((".safetensors", ".bin"))
+                        for f in os.listdir(_local_v)
+                        if os.path.isfile(os.path.join(_local_v, f))):
+                    source = _local_v
+                    print(f"   [VisionDescribe] Using pre-downloaded local: {source}")
+                else:
+                    try:
+                        source = snapshot_download(hf_id, max_workers=8, resume_download=True)
+                    except Exception:
+                        source = hf_id
             else:
                 os.environ["TRANSFORMERS_OFFLINE"] = "1"
                 source = hf_id
@@ -1555,12 +1703,28 @@ class EasyPromptEngine:
         if self._model is not None:
             self._unload()
         hf_id = self.MODELS[key]
-        if not self.offline:
+
+        # Check for offline path override (global config)
+        _offline_path = globals().get("OFFLINE_LLM_PATH", "")
+        if _offline_path and os.path.isdir(_offline_path):
+            source = _offline_path
+            print(f"   [EasyPrompt] Using OFFLINE_LLM_PATH: {source}")
+        elif not self.offline:
             os.environ.pop("TRANSFORMERS_OFFLINE", None)
-            try:
-                source = snapshot_download(hf_id)
-            except Exception:
-                source = hf_id
+            # Try pre-downloaded local cache first (from download_llm_model)
+            _local_candidate = os.path.join(
+                globals().get("LLM_MODELS_DIR", "/content/ComfyUI/models/llm"), key)
+            if os.path.isdir(_local_candidate) and any(
+                    f.endswith((".safetensors", ".bin"))
+                    for f in os.listdir(_local_candidate)
+                    if os.path.isfile(os.path.join(_local_candidate, f))):
+                source = _local_candidate
+                print(f"   [EasyPrompt] Using pre-downloaded local: {source}")
+            else:
+                try:
+                    source = snapshot_download(hf_id, max_workers=8, resume_download=True)
+                except Exception:
+                    source = hf_id
         else:
             os.environ["TRANSFORMERS_OFFLINE"] = "1"
             source = hf_id
@@ -3728,6 +3892,17 @@ USE_TILED_VAE = True  # @param {type:"boolean"}
 USE_VISION = False    # @param {type:"boolean"}
 SHOW_PREVIEWS = True  # @param {type:"boolean"}
 
+# -- Offline model paths (skip HuggingFace download, use local/pre-downloaded models) --
+# Set to a local directory containing the model files to avoid re-downloading.
+# Leave empty "" to use default HuggingFace download behavior.
+OFFLINE_LLM_PATH = ""     # @param {type:"string"}
+# Example: "/content/ComfyUI/models/llm/3B"
+# Example: "/content/drive/MyDrive/models/NeuralDaredevil-8B"
+
+OFFLINE_VISION_PATH = ""  # @param {type:"string"}
+# Example: "/content/ComfyUI/models/llm/vision_3B-fast"
+# Example: "/content/drive/MyDrive/models/Qwen2.5-VL-3B"
+
 # -- Reference / seed image --
 SEED_IMAGE_PATH = None  # @param {type:"string"}
 
@@ -3832,6 +4007,25 @@ if torch.cuda.is_available():
             print("   WARNING: USE_VISION=True may OOM on T4. Set to False if RAM crashes.")
         if LLM_MODEL not in ("disabled", "3B"):
             print("   WARNING: LLM_MODEL='8B' needs L4/A100. Use 'disabled' or '3B' on T4.")
+
+# -- Auto-download LLM/Vision if enabled and no offline path set --
+if USE_LLM_PROMPT and LLM_MODEL not in ("disabled", "") and not OFFLINE_LLM_PATH:
+    try:
+        _downloaded_llm = download_llm_model(LLM_MODEL)
+        if _downloaded_llm:
+            OFFLINE_LLM_PATH = _downloaded_llm
+            print(f"   LLM auto-downloaded: {OFFLINE_LLM_PATH}")
+    except Exception as _e:
+        print(f"   LLM auto-download skipped: {_e}")
+
+if USE_VISION and not OFFLINE_VISION_PATH:
+    try:
+        _downloaded_vision = download_vision_model(VISION_MODEL)
+        if _downloaded_vision:
+            OFFLINE_VISION_PATH = _downloaded_vision
+            print(f"   Vision auto-downloaded: {OFFLINE_VISION_PATH}")
+    except Exception as _e:
+        print(f"   Vision auto-download skipped: {_e}")
 
 print("Configuration ready.")
 print(f"   Mode     : {GENERATION_MODE}")

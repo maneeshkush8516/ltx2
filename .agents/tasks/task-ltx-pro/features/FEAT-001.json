@@ -1,0 +1,46 @@
+{
+  "id": "FEAT-001",
+  "type": "feat",
+  "description": "Create the complete LTX-pro.PY file (~1200-1500 lines) as a production-quality Google Colab notebook for LTX-2 video generation that works on T4 (15GB VRAM) without crashing. Uses sequential model loading pattern from LTX2_InfiniteFlow_12Scene.py as the foundation.",
+  "status": "in_progress",
+  "steps": [
+    "Create /projects/sandbox/ltx2/LTX-pro.PY with the following cell structure:",
+    "",
+    "CELL 1 - ENVIRONMENT SETUP (~80 lines): Use subprocess.run() for all shell commands (no ! or % magic). Include pip install commands, ComfyUI clone with pinned branches (Isi-dev forks), custom node clones (ComfyUI_KJNodes, ComfyUI_GGUF, ComfyUI-LTXVideo, LTX2EasyPrompt-LD, LTX2-Master-Loader, ComfyUI-VideoHelperSuite), requirements install, aria2/ffmpeg install, sys.path setup. Pattern comes directly from LTX2_InfiniteFlow_12Scene.py Cell 1 but converted to use _shell() helper like LTX.PY does (subprocess-based, no magic). Add if-not-exists checks for idempotency.",
+    "",
+    "CELL 2 - MODEL DOWNLOADS (~100 lines): aria2c download function _dl() with caching (skip if file >1MB exists). Download: ltx-2-19b-distilled_Q4_K_M.gguf (UNet), gemma_3_12B_it_fp4_mixed.safetensors (CLIP1), ltx-2-19b-embeddings_connector_distill_bf16.safetensors (CLIP2), LTX2_video_vae_bf16.safetensors (VAE), LTX2_audio_vae_bf16.safetensors (AudioVAE), taeltx2_3.safetensors (TinyVAE for preview), ltx-2-spatial-upscaler-x2-1.0.safetensors (upscaler), 11 LoRAs (Detailer, camera controls). Add optional download_llm_model() and download_vision_model() functions using huggingface_hub snapshot_download with max_workers=8. Support OFFLINE_LLM_PATH and OFFLINE_VISION_PATH.",
+    "",
+    "CELL 3 - CORE IMPORTS & HELPERS (~120 lines): Standard imports (gc, re, json, time, shutil, warnings, asyncio, numpy, torch, cv2, PIL, pathlib, typing, base64, IPython.display). Utility functions: _vram_free() (gc.collect + torch.cuda.empty_cache + ipc_collect), _vram_print(tag), get_value_at_index(), pil_to_tensor(), tensor_to_pil(), load_image_tensor(), get_last_frame_tensor(), display_video(), save_video_obj(), concatenate_clips(). ComfyUI node loader: _load_comfy_nodes() with nest_asyncio pattern. _audio_vae() helper. LD_LORA_STACK (list of 10 dicts) and _apply_loras(unet, clip_model) function. All taken directly from LTX2_InfiniteFlow_12Scene.py patterns.",
+    "",
+    "CELL 4 - CONFIGURATION (~80 lines): Video params: WIDTH=768, HEIGHT=512, FRAMES=121, FPS=25, SEED=42, POSITIVE_PROMPT (default cinematic test prompt), NEGATIVE_PROMPT (default from _NEG_BASE). Model filenames (matching Cell 2 downloads). Pass1 settings: sigmas string, sampler='euler', cfg=1.0. Pass2 settings: sigmas string, sampler='gradient_estimation', cfg=1.0, seed=0. Tiled VAE: use_tiled=True, spatial_tiles=2, spatial_overlap=8, temporal_tile_length=48, temporal_overlap=4. NEW params: USE_LLM_PROMPT=False (disabled by default), LLM_MODEL='3B' (safest for T4), USE_VISION=False (disabled by default), OFFLINE_LLM_PATH='', OFFLINE_VISION_PATH='', SEED_IMAGE_PATH=None, IMAGE_STRENGTH=1.0, CREATIVITY=0.9, LORA_TRIGGERS='', SHOW_PREVIEWS=True, OUTPUT_DIR. GPU tier auto-detection with warnings (T4/L4/A100 detection).",
+    "",
+    "CELL 5 - OPTIONAL: VisionDescribe + EasyPrompt (~250 lines): VisionDescribeEngine class from LTX2_InfiniteFlow_12Scene.py SECTION A - loads Qwen2.5-VL (3B or 7B), describes image, FULLY deletes and frees VRAM before returning. Support OFFLINE_VISION_PATH. Wrapped in try/except. EasyPromptEngine class from SECTION B - loads LLM (3B Llama or 8B NeuralDaredevil), expands prompt with pacing/character bible/scene context, cleans output, FULLY deletes and frees VRAM. If model_size=='disabled', returns raw text (zero cost). Wrapped in try/except with fallback to raw prompt. _build_neg() negative prompt builder. CharacterBible class from SECTION C (lightweight, no model loading) - stores character attributes, serializes as prompt injection block, to_prompt_block() method.",
+    "",
+    "CELL 6 - generate_clip() (~250 lines): Based EXACTLY on LTX2_InfiniteFlow_12Scene.py SECTION D generate_clip() function. T4-safe VRAM sequence: (1) Load DualCLIPLoader -> CLIPTextEncode -> ConditioningZeroOut -> LTXVConditioning -> DELETE clip_raw -> _vram_free(). (2) Load UnetLoaderGGUF -> _apply_loras -> _vram_print. (3) Load VAELoader (video + audio) + LatentUpscaleModelLoader. (4) Prepare latents: EmptyImage -> ResizeImageMaskNode (0.5x) -> GetImageSize -> EmptyLTXVLatentVideo. If image provided: resize image -> LTXVPreprocess -> LTXVImgToVideoInplace (I2V mode). LTXVEmptyLatentAudio -> LTXVConcatAVLatent. (5) Pass 1: ManualSigmas + KSamplerSelect + RandomNoise + CFGGuider + SamplerCustomAdvanced. (6) Pass 2: LTXVSeparateAVLatent -> LTXVCropGuides -> LTXVLatentUpsampler -> concat -> sample again. Delete UNet + _vram_free(). (7) Decode: LTXVSpatioTemporalTiledVAEDecode (with fallback to VAEDecode). Delete vae_v. (8) Audio decode: LTXVAudioVAEDecode. Delete vae_a. (9) Save: CreateVideo -> save_video_obj. Return path.",
+    "",
+    "CELL 7 - InfiniteFlowEngine (~200 lines): Class that orchestrates multi-clip generation. scene_chain mode: for each beat in STORY_BEATS: (1) Optional VisionDescribe on last frame -> get scene context -> DELETE model -> _vram_free(). (2) Optional EasyPrompt expand -> get cinematic prompt -> DELETE model -> _vram_free(). (3) generate_clip() with prompt. (4) Extract last frame via get_last_frame_tensor() for chaining. OOM handling: try/except torch.cuda.OutOfMemoryError -> reduce frames and retry in T2V mode. Rolling scene context (last 2 prompts). CharacterBible injection. concat_all() for final video. display_video() previews.",
+    "",
+    "CELL 8 - CONFIGURATION (user-facing) (~60 lines): STORY_BEATS list (default 3 example beats for quick test). USE_LLM_PROMPT, USE_VISION toggles. Character bible setup. LoRA stack config. Print config summary.",
+    "",
+    "CELL 9 - RUN (~40 lines): Simple _run() function that: creates InfiniteFlowEngine with all config, calls engine.run(story_beats, seed_image_path, base_seed), optionally concatenates clips, displays final video, prints completion message."
+  ],
+  "acceptance_criteria": [
+    "File /projects/sandbox/ltx2/LTX-pro.PY exists and is valid Python (passes ast.parse())",
+    "File is between 1000-1500 lines (not bloated like the 3827-line LTX.PY)",
+    "No Colab magic commands (! or %) - all shell commands use subprocess.run()",
+    "USE_LLM_PROMPT defaults to False and USE_VISION defaults to False (T4-safe by default)",
+    "The generate_clip() function follows strict sequential VRAM pattern: CLIP load->encode->DELETE->UNet load->sample->DELETE->VAE load->decode->save",
+    "Every model load has a corresponding del + _vram_free() call before the next model loads",
+    "I2V support via LTXVImgToVideoInplace is included in generate_clip()",
+    "VisionDescribeEngine and EasyPromptEngine classes are wrapped in try/except and fully delete models after use",
+    "GPU tier auto-detection with warnings is present in configuration cell",
+    "OFFLINE_LLM_PATH and OFFLINE_VISION_PATH support is present"
+  ],
+  "verification": [
+    "Run: python -c \"import ast; ast.parse(open('/projects/sandbox/ltx2/LTX-pro.PY').read()); print('AST OK')\"",
+    "Run: python -c \"content = open('/projects/sandbox/ltx2/LTX-pro.PY').read(); lines = content.splitlines(); print(f'Lines: {len(lines)}'); assert 1000 <= len(lines) <= 1500, f'Line count {len(lines)} out of range'\"",
+    "Run: python -c \"content = open('/projects/sandbox/ltx2/LTX-pro.PY').read(); assert '!pip' not in content and '!git' not in content and '%cd' not in content, 'Found Colab magic commands'\""
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

@@ -288,6 +288,25 @@ def get_last_frame_tensor(video_path: str) -> Optional[torch.Tensor]:
     return torch.from_numpy(frame).float().unsqueeze(0) / 255.0
 
 
+def extract_frame_at_position(video_path: str, fraction: float = 0.33) -> Optional[torch.Tensor]:
+    """Extract a single frame at a fractional position from a video."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total == 0:
+        cap.release()
+        return None
+    target = int(total * fraction)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        return None
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return torch.from_numpy(frame).float().unsqueeze(0) / 255.0
+
+
 def extract_overlap_frames(video_path: str, n_frames: int = OVERLAP_FRAMES) -> Optional[torch.Tensor]:
     """
     Extract the last N frames from a video as a batch tensor [N, H, W, 3].
@@ -737,6 +756,8 @@ _NEG_BASE = (
     "missing limbs, overexposed, underexposed, grainy, noise, flickering"
 )
 
+QUALITY_SUFFIX = "Ultra HDR, 3D intricate details, vibrant colors, realistic lighting, Dramatic Lighting, Enhanced Clarity, Brilliant Highlights, Hyperrealistic Detailing, cinematic."
+
 
 def _build_neg(result: str, user_input: str) -> str:
     """Build a context-aware negative prompt from the expanded result."""
@@ -899,7 +920,8 @@ class EasyPromptEngine:
         return text.strip()
 
     def _raw_generate(self, system_prompt: str, user_content: str,
-                      max_tokens: int = 600, temperature: float = 0.9) -> str:
+                      max_tokens: int = 600, temperature: float = 0.9,
+                      min_tokens: Optional[int] = None) -> str:
         """Low-level generation: load model, run inference, return raw text."""
         self._load()
 
@@ -924,14 +946,18 @@ class EasyPromptEngine:
 
         input_len = input_ids.shape[1]
 
+        gen_kwargs = dict(
+            max_new_tokens=max_tokens,
+            temperature=temperature, do_sample=True, top_k=40, top_p=0.9,
+            repetition_penalty=1.07, use_cache=True,
+            pad_token_id=self._tok.eos_token_id,
+            eos_token_id=self._stop_ids(),
+        )
+        if min_tokens is not None:
+            gen_kwargs["min_new_tokens"] = min_tokens
+
         with torch.no_grad():
-            out = self._model.generate(
-                input_ids, max_new_tokens=max_tokens,
-                temperature=temperature, do_sample=True, top_k=40, top_p=0.9,
-                repetition_penalty=1.07, use_cache=True,
-                pad_token_id=self._tok.eos_token_id,
-                eos_token_id=self._stop_ids(),
-            )
+            out = self._model.generate(input_ids, **gen_kwargs)
         result = self._tok.decode(out[0][input_len:], skip_special_tokens=True).strip()
         del out, input_ids
         return result
@@ -1005,42 +1031,14 @@ class EasyPromptEngine:
 
         user_content = f"{pacing}{bible_clause}{lora_clause}\n\n{effective}"
 
-        self._load()
-
-        is_qwen3 = "Qwen3" in self.MODELS.get(self.model_size, "")
-        messages = [
-            {"role": "system", "content": self.SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ]
-        kwargs = {"enable_thinking": False} if is_qwen3 else {}
-        raw = self._tok.apply_chat_template(
-            messages, return_tensors="pt", add_generation_prompt=True, **kwargs
+        result = self._raw_generate(
+            self.SYSTEM_PROMPT, user_content,
+            max_tokens=max_tokens, temperature=creativity,
+            min_tokens=min_tokens,
         )
-
-        if hasattr(raw, "input_ids"):
-            input_ids = raw.input_ids.to(self._model.device)
-        elif isinstance(raw, dict):
-            input_ids = raw["input_ids"].to(self._model.device)
-        elif isinstance(raw, list):
-            input_ids = torch.tensor([raw], dtype=torch.long).to(self._model.device)
-        else:
-            input_ids = raw.to(self._model.device)
-
-        input_len = input_ids.shape[1]
-
-        with torch.no_grad():
-            out = self._model.generate(
-                input_ids, min_new_tokens=min_tokens, max_new_tokens=max_tokens,
-                temperature=creativity, do_sample=True, top_k=40, top_p=0.9,
-                repetition_penalty=1.07, use_cache=True,
-                pad_token_id=self._tok.eos_token_id,
-                eos_token_id=self._stop_ids(),
-            )
-
-        result = self._tok.decode(out[0][input_len:], skip_special_tokens=True).strip()
         result = self._clean(result)
         result = re.sub(r"\s*[\(\[]\s*$", "", result).strip()
-        del out, input_ids
+        result = result.rstrip(".") + ". " + QUALITY_SUFFIX
         neg = _build_neg(result, user_input)
 
         if not self.keep_loaded:
@@ -1112,6 +1110,7 @@ class EasyPromptEngine:
         scenes: List[str],
         bible: "CharacterBible",
         environment: Dict[str, str],
+        frame_count: int = 121,
     ) -> List[Tuple[str, str]]:
         """
         Generate per-scene (positive, negative) prompt tuples.
@@ -1133,6 +1132,7 @@ class EasyPromptEngine:
             pos, neg = self.generate(
                 user_input=scene_input,
                 character_bible=bible_block,
+                frame_count=frame_count,
             )
             results.append((pos, neg))
 
@@ -1362,6 +1362,9 @@ def generate_clip(
     anchor_weight: Blend factor for anchor_image (0.0 = pure prev_samples,
         1.0 = pure anchor). Default 0.25 provides subtle consistency.
     """
+    if pass2_seed == 0:
+        pass2_seed = seed + 7919
+
     _load_comfy_nodes()
 
     # Overlap frame extraction fallback: only runs if the caller did NOT already
@@ -1689,11 +1692,20 @@ def generate_clip(
         _vram_free()
 
         # -- STEP 10: Save --
-        cv_node = NODE_CLASS_MAPPINGS["CreateVideo"]()
-        vid_obj = cv_node.EXECUTE_NORMALIZED(
-            fps=fps, images=decoded, audio=get_value_at_index(audio, 0)
-        )
-        path = save_video_obj(get_value_at_index(vid_obj, 0), prefix=output_prefix)
+        try:
+            cv_node = NODE_CLASS_MAPPINGS["CreateVideo"]()
+            vid_obj = cv_node.EXECUTE_NORMALIZED(
+                fps=fps, images=decoded, audio=get_value_at_index(audio, 0)
+            )
+            path = save_video_obj(get_value_at_index(vid_obj, 0), prefix=output_prefix)
+        except Exception as e:
+            print(f"   [Clip] CreateVideo failed ({e}), falling back to imageio...")
+            import imageio
+            frames_np = (decoded.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            fallback_dir = folder_paths.get_output_directory()
+            path = os.path.join(fallback_dir, f"{output_prefix}_{seed}.mp4")
+            imageio.mimwrite(path, frames_np, fps=fps, codec='libx264')
+            print(f"   [Clip] Saved via imageio -> {path}")
         _vram_print("after save")
         return path
 

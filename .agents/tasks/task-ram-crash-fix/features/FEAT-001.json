@@ -1,0 +1,24 @@
+{
+  "id": "FEAT-001",
+  "type": "fix",
+  "description": "Fix RAM crash on T4 by making VisionDescribe and EasyPrompt LLM features optional and disabled by default. When disabled, the script works like the reference T4 script: manual prompts only, no LLM expansion, no Vision model loading.",
+  "status": "in_progress",
+  "steps": [
+    "1. In Cell 4 Configuration, change LLM_MODEL default to 'disabled', USE_VISION to False, add USE_LLM_PROMPT config and GPU tier comments.",
+    "2. Add 'disabled': None to EasyPromptEngine.MODELS dict.",
+    "3. In EasyPromptEngine.generate(), add early return when model_size is 'disabled' to skip LLM loading entirely.",
+    "4. In InfiniteFlowEngine.__init__(), only create VisionDescribeEngine if use_vision is True.",
+    "5. In _process_beat(), wrap Vision Describe call with OOM try/except.",
+    "6. Add GPU tier auto-detection warning block in Cell 4."
+  ],
+  "acceptance_criteria": [
+    "AST parse passes",
+    "LLM_MODEL defaults to 'disabled'",
+    "USE_VISION defaults to False",
+    "EasyPromptEngine.generate() returns raw beat when model_size=='disabled'",
+    "VisionDescribeEngine is not created when use_vision=False",
+    "GPU tier warnings printed for T4 when features are enabled"
+  ],
+  "blocked_reason": null,
+  "findings": null
+}

@@ -1,0 +1,9 @@
+{
+  "project_type": "Single-file Python Colab notebook for AI video generation using LTX-2 19B GGUF model",
+  "language": "Python",
+  "build_command": "python -c \"import ast; ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); print('AST valid')\"",
+  "test_command": "python -c \"import ast; ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); print('AST valid')\"",
+  "verification_instructions": "1. Run AST parse to confirm valid Python syntax. 2. Check all class/function definitions intact. 3. Verify Cell 1-5 structure preserved.",
+  "setup_instructions": "No setup needed - validation via AST parsing only.",
+  "environment_constraints": "No GPU available for actual execution. Validation limited to AST parsing."
+}

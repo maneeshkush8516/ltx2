@@ -1,0 +1,8 @@
+{
+  "task_id": "task-ram-crash-fix",
+  "task_description": "Fix RAM crash on T4 by making VisionDescribe and EasyPrompt features optional and disabled by default.",
+  "status": "in_progress",
+  "feature_order": ["FEAT-001"],
+  "blocked_reason": null,
+  "verification": null
+}

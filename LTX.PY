@@ -1496,6 +1496,7 @@ class EasyPromptEngine:
     """
 
     MODELS = {
+        "disabled": None,  # Skip LLM, use raw beat text as prompt
         "8B": "mlabonne/NeuralDaredevil-8B-abliterated",
         "3B": "huihui-ai/Llama-3.2-3B-Instruct-abliterated",
         "14B": "huihui-ai/Huihui-Qwen3-14B-abliterated-v2",
@@ -1544,6 +1545,8 @@ class EasyPromptEngine:
         self._loaded_key = None
 
     def _load(self):
+        if self.model_size == "disabled":
+            return
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from huggingface_hub import snapshot_download
         key = self.model_size
@@ -1617,7 +1620,14 @@ class EasyPromptEngine:
 
         character_bible is injected as a hard [CHARACTER BIBLE - NON-NEGOTIABLE]
         block so the LLM cannot alter hair, age, clothing, or any locked attribute.
+
+        If model_size is "disabled", returns the raw beat as-is (no LLM expansion).
         """
+        # If LLM is disabled, return the raw beat as-is (no expansion)
+        if self.model_size == "disabled":
+            neg = _build_neg(user_input, user_input)
+            return user_input, neg
+
         self._load()
 
         real_seconds = frame_count / 25.0
@@ -2668,7 +2678,7 @@ class InfiniteFlowEngine:
         self._drive = DriveIntegration(drive_output_dir) if google_drive_sync else None
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-        self._vision_engine = VisionDescribeEngine(vision_model, offline)
+        self._vision_engine = VisionDescribeEngine(vision_model, offline) if use_vision else None
         self._prompt_engine = EasyPromptEngine(llm_model, offline, keep_loaded=False)
 
         self._clip_paths: List[str] = []
@@ -2746,9 +2756,16 @@ class InfiniteFlowEngine:
         beat_seed = base_seed + (beat_idx - 1) * 1000
 
         # Vision Describe - only from beat 2 onward
-        if beat_idx > 1 and current_image is not None and self.use_vision:
+        if beat_idx > 1 and current_image is not None and self.use_vision and self._vision_engine is not None:
             print(f"   [Beat {beat_idx}] Vision Describe...")
-            scene_ctx = self._vision_engine.describe(current_image)
+            try:
+                scene_ctx = self._vision_engine.describe(current_image)
+            except (RuntimeError, Exception) as e:
+                if "out of memory" in str(e).lower() or "CUDA" in str(e):
+                    print(f"   [Beat {beat_idx}] Vision skipped (OOM): {e}")
+                else:
+                    print(f"   [Beat {beat_idx}] Vision skipped (error): {e}")
+                scene_ctx = self._rolling_ctx()
             _vram_free()
         else:
             scene_ctx = self._rolling_ctx()
@@ -2954,9 +2971,13 @@ class InfiniteFlowEngine:
         if seed_image_path and os.path.exists(seed_image_path):
             current_image = load_image_tensor(seed_image_path)
             print(f"[IFE] Seed image loaded: {seed_image_path}")
-            if not self.bible.has_characters() and self.use_vision:
+            if not self.bible.has_characters() and self.use_vision and self._vision_engine is not None:
                 print("[IFE] Extracting Character Bible from seed image...")
-                chars = self._vision_engine.describe_characters(current_image)
+                try:
+                    chars = self._vision_engine.describe_characters(current_image)
+                except (RuntimeError, Exception) as e:
+                    print(f"[IFE] Vision character extraction skipped: {e}")
+                    chars = []
                 _vram_free()
                 if len(chars) > 1:
                     # Multiple characters detected
@@ -2972,7 +2993,8 @@ class InfiniteFlowEngine:
                     print(f"[IFE] Bible set:\n{desc[:200]}...\n")
 
         # Enable vision engine keep_loaded during prompt phase
-        self._vision_engine.keep_loaded = True
+        if self._vision_engine is not None:
+            self._vision_engine.keep_loaded = True
 
         for beat_idx, beat in enumerate(story_beats, 1):
             # Skip beats already completed (checkpoint resume)
@@ -3032,7 +3054,8 @@ class InfiniteFlowEngine:
                 print(f"  PER-BEAT FRAMES: {beat_frames}")
 
             # Unload vision engine before video generation
-            self._vision_engine.unload()
+            if self._vision_engine is not None:
+                self._vision_engine.unload()
 
             # Inject camera LoRA into stack if detected
             orig_lora_stack = None
@@ -3110,7 +3133,8 @@ class InfiniteFlowEngine:
             if (self.drift_check_interval > 0
                     and beat_idx % self.drift_check_interval == 0
                     and current_image is not None
-                    and self.bible.has_characters()):
+                    and self.bible.has_characters()
+                    and self._vision_engine is not None):
                 print(f"[IFE]    Running bible drift check (interval={self.drift_check_interval})...")
                 drift_report = self.bible.validate_bible(current_image, self._vision_engine)
                 # Explicitly unload vision model after drift check to reclaim VRAM
@@ -3162,9 +3186,13 @@ class InfiniteFlowEngine:
             current_image = load_image_tensor(seed_image_path)
             anchor_samples = current_image.clone()
             print(f"[IFE-TE] Seed/anchor image loaded: {seed_image_path}")
-            if not self.bible.has_characters() and self.use_vision:
+            if not self.bible.has_characters() and self.use_vision and self._vision_engine is not None:
                 print("[IFE-TE] Extracting Character Bible from seed image...")
-                chars = self._vision_engine.describe_characters(current_image)
+                try:
+                    chars = self._vision_engine.describe_characters(current_image)
+                except (RuntimeError, Exception) as e:
+                    print(f"[IFE-TE] Vision character extraction skipped: {e}")
+                    chars = []
                 _vram_free()
                 if len(chars) > 1:
                     for entry in chars:
@@ -3185,7 +3213,8 @@ class InfiniteFlowEngine:
         print(f"[IFE-TE]  Story beats available: {len(story_beats)}")
 
         # Enable vision engine keep_loaded during prompt phase
-        self._vision_engine.keep_loaded = True
+        if self._vision_engine is not None:
+            self._vision_engine.keep_loaded = True
 
         for seg_idx in range(total_segments):
             is_initial = (seg_idx == 0)
@@ -3203,9 +3232,13 @@ class InfiniteFlowEngine:
             print(f"[IFE-TE]   Seed: {seg_seed}")
 
             # Vision describe on prev_samples (for extensions)
-            if not is_initial and current_image is not None and self.use_vision:
+            if not is_initial and current_image is not None and self.use_vision and self._vision_engine is not None:
                 print(f"   [Seg {seg_idx + 1}] Vision Describe on prev_samples...")
-                scene_ctx = self._vision_engine.describe(current_image)
+                try:
+                    scene_ctx = self._vision_engine.describe(current_image)
+                except (RuntimeError, Exception) as e:
+                    print(f"   [Seg {seg_idx + 1}] Vision skipped: {e}")
+                    scene_ctx = self._rolling_ctx()
                 _vram_free()
             else:
                 scene_ctx = self._rolling_ctx()
@@ -3236,7 +3269,8 @@ class InfiniteFlowEngine:
             print(f"\n  EXPANDED ({len(prompt.split())}w): {prompt[:200]}...")
 
             # Unload vision engine before video generation to free VRAM
-            self._vision_engine.unload()
+            if self._vision_engine is not None:
+                self._vision_engine.unload()
 
             # For extensions: use prev_samples (last frame) as I2V input
             # For initial: use anchor_samples (seed image) or None for T2V
@@ -3285,7 +3319,8 @@ class InfiniteFlowEngine:
             if (self.drift_check_interval > 0
                     and (seg_idx + 1) % self.drift_check_interval == 0
                     and current_image is not None
-                    and self.bible.has_characters()):
+                    and self.bible.has_characters()
+                    and self._vision_engine is not None):
                 print(f"[IFE-TE]    Running bible drift check "
                       f"(interval={self.drift_check_interval})...")
                 drift_report = self.bible.validate_bible(
@@ -3674,7 +3709,10 @@ print("   D: generate_clip()       E: InfiniteFlowEngine")
 # @markdown ## 4. Configuration
 
 # -- LLM / Vision --
-LLM_MODEL = "8B"         # @param ["8B","3B","14B"]
+# Set USE_LLM_PROMPT=True and LLM_MODEL="3B" for T4, "8B" for L4/A100
+# Set USE_VISION=True only on L4/A100 (needs extra ~6GB RAM)
+USE_LLM_PROMPT = False    # @param {type:"boolean"}
+LLM_MODEL = "disabled"    # @param ["disabled","3B","8B","14B"]
 VISION_MODEL = "3B-fast"  # @param ["3B-fast","7B-nsfw"]
 CREATIVITY = 0.9          # @param {type:"number"}
 
@@ -3687,7 +3725,7 @@ FPS = 25              # @param {type:"integer"}
 BASE_SEED = 42        # @param {type:"integer"}
 IMAGE_STRENGTH = 1.0  # @param {type:"number"}
 USE_TILED_VAE = True  # @param {type:"boolean"}
-USE_VISION = True     # @param {type:"boolean"}
+USE_VISION = False    # @param {type:"boolean"}
 SHOW_PREVIEWS = True  # @param {type:"boolean"}
 
 # -- Reference / seed image --
@@ -3781,6 +3819,20 @@ STORY_BEATS = [
      "looks both ways, then runs toward the far end where a taxi waits with its light on"),
 ]
 
+# -- Sync USE_LLM_PROMPT with LLM_MODEL --
+# When USE_LLM_PROMPT is False, force LLM_MODEL to "disabled" regardless of dropdown
+if not USE_LLM_PROMPT and LLM_MODEL != "disabled":
+    LLM_MODEL = "disabled"
+
+# -- GPU Tier Auto-Detection --
+if torch.cuda.is_available():
+    _gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    if _gpu_mem < 20:  # T4 (15GB)
+        if USE_VISION:
+            print("   WARNING: USE_VISION=True may OOM on T4. Set to False if RAM crashes.")
+        if LLM_MODEL not in ("disabled", "3B"):
+            print("   WARNING: LLM_MODEL='8B' needs L4/A100. Use 'disabled' or '3B' on T4.")
+
 print("Configuration ready.")
 print(f"   Mode     : {GENERATION_MODE}")
 print(f"   Beats    : {len(STORY_BEATS)}")
@@ -3847,7 +3899,11 @@ def _run():
 
     # Mount Google Drive if enabled
     if GOOGLE_DRIVE_SYNC and engine._drive:
-        engine._drive.mount()
+        try:
+            engine._drive.mount()
+        except Exception as e:
+            print(f"   WARNING: Google Drive mount failed: {e}")
+            print(f"   Continuing without Drive sync.")
 
     clip_paths = engine.run(
         story_beats=STORY_BEATS,

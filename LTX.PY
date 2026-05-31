@@ -193,7 +193,10 @@ from pathlib import Path
 from typing import Optional, List, Any, Union, Sequence, Mapping, Dict, Tuple
 from base64 import b64encode
 from IPython.display import display, HTML, clear_output
-from google.colab import files
+try:
+    from google.colab import files
+except ImportError:
+    files = None
 
 warnings.filterwarnings("ignore")
 sys.path.insert(0, "/content/ComfyUI")
@@ -481,7 +484,8 @@ def _apply_loras(unet, clip_model):
     ]
     if not active:
         return unet, clip_model
-    if "LTX2MasterLoaderLD" in NODE_CLASS_MAPPINGS:
+    # LTX2MasterLoaderLD requires a valid clip_model; skip if None
+    if clip_model is not None and "LTX2MasterLoaderLD" in NODE_CLASS_MAPPINGS:
         try:
             node = NODE_CLASS_MAPPINGS["LTX2MasterLoaderLD"]()
             result = getattr(node, node.FUNCTION)(
@@ -1330,13 +1334,18 @@ def generate_clip(
     """
     _load_comfy_nodes()
 
-    # If prev_clip_path is given and overlap_frames > 0, extract overlap frames
+    # Overlap frame extraction fallback: only runs if the caller did NOT already
+    # provide an image_tensor. When _run_svi_pro_extend passes both overlap_frames
+    # and prev_clip_path alongside a pre-extracted image_tensor, this guard
+    # (image_tensor is None) correctly prevents double-extraction.
     if prev_clip_path and overlap_frames > 0 and image_tensor is None:
         overlap_batch = extract_overlap_frames(prev_clip_path, n_frames=overlap_frames)
         if overlap_batch is not None:
-            # Use last frame from overlap batch as conditioning image
+            # NOTE: Single-frame conditioned - LTXVImgToVideoInplace only accepts
+            # single images. For true multi-frame conditioning, latent-space blending
+            # of the full overlap batch would be needed.
             image_tensor = overlap_batch[-1:, :, :, :]
-            print(f"   [Clip] Extracted {overlap_frames} overlap frames from prev clip")
+            print(f"   [Clip] Extracted {overlap_frames} overlap frames (using last frame for conditioning)")
 
     img_bypass = image_tensor is None
     img_str = image_strength if not img_bypass else 0.0
@@ -1359,18 +1368,26 @@ def generate_clip(
 
         cte = NODE_CLASS_MAPPINGS["CLIPTextEncode"]()
         cond_pos = cte.encode(text=prompt, clip=clip_raw)
-        # CFG=1.0 uses zeroed-out negative (not text-encoded negatives)
-        zero_out = NODE_CLASS_MAPPINGS["ConditioningZeroOut"]()
-        cond_0 = zero_out.zero_out(conditioning=get_value_at_index(cond_pos, 0))
+        # For CFG > 1.0, encode the negative prompt through CLIP for proper guidance.
+        # For CFG=1.0 (default for distilled models), use zeroed-out conditioning
+        # since the negative has no effect and encoding it wastes compute.
+        if pass1_cfg > 1.0 and neg_prompt:
+            cond_neg_raw = cte.encode(text=neg_prompt, clip=clip_raw)
+            cond_neg = get_value_at_index(cond_neg_raw, 0)
+        else:
+            zero_out = NODE_CLASS_MAPPINGS["ConditioningZeroOut"]()
+            cond_neg = get_value_at_index(
+                zero_out.zero_out(conditioning=get_value_at_index(cond_pos, 0)), 0
+            )
         ltxv_cn = NODE_CLASS_MAPPINGS["LTXVConditioning"]()
         cond = ltxv_cn.EXECUTE_NORMALIZED(
             frame_rate=float(fps),
             positive=get_value_at_index(cond_pos, 0),
-            negative=get_value_at_index(cond_0, 0),
+            negative=cond_neg,
         )
 
         # Delete CLIP now - frees ~6-8 GB for UNet
-        del clip_raw, clip_ld, cte, zero_out
+        del clip_raw, clip_ld, cte
         _vram_free()
         _vram_print("CLIP deleted")
 
@@ -1546,7 +1563,12 @@ def generate_clip(
         upscaled_latent = get_value_at_index(up, 0)
         if not img_bypass and conditioning_img is not None:
             print("   [Clip] Re-applying I2V conditioning on upscaled latent (LD-I2V pattern)...")
-            # Reload VAE for I2V re-conditioning
+            # Delete existing VAE before re-conditioning to avoid duplicate VAE in VRAM.
+            # Matches reference PRO v2 single-VAE-at-a-time pattern.
+            del vae_v, vae_ld
+            _vram_free()
+
+            # Load fresh VAE for I2V re-conditioning
             vae_ld2 = NODE_CLASS_MAPPINGS["VAELoader"]()
             vae_v2 = get_value_at_index(vae_ld2.load_vae(vae_name=_M_VAE), 0)
 
@@ -1595,6 +1617,11 @@ def generate_clip(
         _vram_free()
         _vram_print("UNet deleted")
         print("   [Clip] Pass 2 done")
+
+        # Reload VAE for decode if it was deleted during I2V re-conditioning
+        if not img_bypass and conditioning_img is not None:
+            vae_ld = NODE_CLASS_MAPPINGS["VAELoader"]()
+            vae_v = get_value_at_index(vae_ld.load_vae(vae_name=_M_VAE), 0)
 
         # -- STEP 8: Decode video --
         s2 = sep.EXECUTE_NORMALIZED(av_latent=p2_den)
@@ -1994,9 +2021,12 @@ class InfiniteFlowEngine:
             if seg_idx >= len(story_beats):
                 beat = f"Continue seamlessly from the previous scene. {beat}"
 
-            # Build shot data for adaptive strength
+            # Build shot data for adaptive strength.
+            # Vary motion_intensity by segment index: later segments get higher
+            # intensity to allow more divergence from the anchor, mimicking
+            # natural escalation in multi-segment generation.
             current_shot_data = {
-                "motion_intensity": 0.5,
+                "motion_intensity": min(0.5 + seg_idx * 0.08, 0.9),
                 "character_focus": "main",
                 "segment_index": seg_idx,
             }
@@ -2015,9 +2045,14 @@ class InfiniteFlowEngine:
             if not is_initial and prev_clip_path:
                 overlap_batch = extract_overlap_frames(prev_clip_path, n_frames=OVERLAP_FRAMES)
                 if overlap_batch is not None:
-                    # Use last frame from overlap batch as the conditioning image
+                    # NOTE: Current implementation is single-frame conditioned because
+                    # LTXVImgToVideoInplace only accepts a single image tensor.
+                    # For true multi-frame SVI-Pro conditioning (temporal coherence at
+                    # boundaries), a latent-space blending approach would be needed:
+                    # encode the overlap batch through VAE into a partial latent,
+                    # then blend/concatenate with the new segment's latent before sampling.
                     current_image = overlap_batch[-1:, :, :, :]
-                    print(f"[IFE-SVI]   Extracted {OVERLAP_FRAMES} overlap frames")
+                    print(f"[IFE-SVI]   Extracted {OVERLAP_FRAMES} overlap frames (using last frame for conditioning)")
 
             # Vision describe
             if not is_initial and current_image is not None and self.use_vision:
@@ -2207,14 +2242,30 @@ class InfiniteFlowEngine:
             if i == 0:
                 trimmed_paths.append(clip_path)
             else:
-                # Trim the first overlap_frames from non-first clips
-                trimmed = clip_path.replace(".mp4", "_trimmed.mp4")
-                subprocess.run(
-                    ["ffmpeg", "-y", "-ss", f"{trim_seconds:.3f}", "-i", clip_path,
-                     "-c", "copy", trimmed],
-                    check=True, capture_output=True,
-                )
-                trimmed_paths.append(trimmed)
+                # Check clip duration before trimming to avoid empty output
+                try:
+                    probe = subprocess.run(
+                        ["ffprobe", "-v", "error", "-show_entries",
+                         "format=duration", "-of", "csv=p=0", clip_path],
+                        capture_output=True, text=True, check=True,
+                    )
+                    clip_duration = float(probe.stdout.strip())
+                except (subprocess.CalledProcessError, ValueError):
+                    clip_duration = 0.0
+
+                if clip_duration <= trim_seconds:
+                    # Clip is too short to trim; use as-is to avoid empty segment
+                    print(f"   [Concat] Clip {i} too short ({clip_duration:.2f}s) to trim, using full clip")
+                    trimmed_paths.append(clip_path)
+                else:
+                    # Trim the first overlap_frames from non-first clips
+                    trimmed = clip_path.replace(".mp4", "_trimmed.mp4")
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-ss", f"{trim_seconds:.3f}", "-i", clip_path,
+                         "-c", "copy", trimmed],
+                        check=True, capture_output=True,
+                    )
+                    trimmed_paths.append(trimmed)
 
         with open(list_file, "w") as f:
             for p in trimmed_paths:
@@ -2230,6 +2281,9 @@ class InfiniteFlowEngine:
 
     def download_all(self):
         """Offer all clips for download in Colab."""
+        if files is None:
+            print("   [Download] google.colab.files not available outside Colab")
+            return
         for p in self._clip_paths:
             if os.path.exists(p):
                 files.download(p)

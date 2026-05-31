@@ -2,7 +2,7 @@
   "id": "FEAT-002",
   "type": "feat",
   "description": "Implement improvements 1, 2, 4, 5, 7 (batch LLM loading, double-expansion fix, anchor self-bootstrap, camera LoRA switching, VisionDescribe skip)",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "1. Improvement #1 (Batch LLM loading): In _run_scene_chain(), before the `for beat_idx, beat in enumerate(story_beats, 1):` loop, add `self._prompt_engine._load()` and `self._prompt_engine.keep_loaded = True`. After the loop ends (before return), add `self._prompt_engine._unload()` and `self._prompt_engine.keep_loaded = False`. Do the same in _run_temporal_extend() and _run_svi_pro_extend() around their generation loops.",
     "2. Improvement #2 (Fix double-expansion): Add a `pre_expanded=False` parameter to run(). When pre_expanded=True, in the mode dispatch, modify the behavior: in _run_scene_chain, skip _process_beat() and use beat text directly as prompt with _build_neg(beat, beat) for negative. Pass pre_expanded through to the mode methods. Update run_from_story() to pass both positives and negatives: change expanded_beats to include neg from scene_prompts, store as list of (pos, neg) tuples or two parallel lists, and pass pre_expanded=True to run().",
@@ -27,5 +27,5 @@
     "grep -n 'extract_frame_at_position' /projects/sandbox/ltx2/LTX.PY | grep -v 'def '"
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "All 5 improvements implemented. _process_beat now returns 4-tuple (prompt, neg, beat_seed, camera_lora). All three mode methods have batch LLM load/unload around loops, pre_expanded support, and self-bootstrap anchor logic. generate_clip accepts camera_lora parameter. _detect_camera_direction added before generate_clip. VisionDescribe skipped when beat > 60 words."
 }

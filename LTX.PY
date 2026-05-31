@@ -1319,6 +1319,26 @@ class CharacterBible:
 #  11. Save as h264-mp4 at 25fps
 
 
+def _detect_camera_direction(beat_text: str) -> Optional[str]:
+    """Detect camera direction keywords in beat text and return matching LoRA filename."""
+    text = beat_text.lower()
+    mapping = [
+        (["dolly in", "dolly forward", "push in", "pushing in", "pushes in"],
+         "ltx-2-19b-lora-camera-control-dolly-in.safetensors"),
+        (["dolly out", "pull back", "pulling back", "dolly backward"],
+         "ltx-2-19b-lora-camera-control-dolly-out.safetensors"),
+        (["dolly left", "slide left", "sliding left"],
+         "ltx-2-19b-lora-camera-control-dolly-left.safetensors"),
+        (["dolly right", "slide right", "sliding right"],
+         "ltx-2-19b-lora-camera-control-dolly-right.safetensors"),
+    ]
+    for keywords, lora_file in mapping:
+        for kw in keywords:
+            if kw in text:
+                return lora_file
+    return None
+
+
 def generate_clip(
     image_tensor: Optional[torch.Tensor],
     prompt: str,
@@ -1347,6 +1367,7 @@ def generate_clip(
     tiled_toverlap: int = 4,
     show_preview: bool = True,
     output_prefix: str = "IFE",
+    camera_lora: Optional[str] = None,
 ) -> str:
     """
     Two-pass LTX-2 19B GGUF generation for one clip.
@@ -1429,7 +1450,14 @@ def generate_clip(
         unet_ld = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]()
         unet = get_value_at_index(unet_ld.load_unet(unet_name=_M_UNET), 0)
         _dummy_clip = None
+        _camera_lora_active = False
+        if camera_lora:
+            LD_LORA_STACK[1] = {"on": True, "lora": camera_lora, "guard": False, "strength": 0.6}
+            _camera_lora_active = True
+            print(f"   [Clip] Camera LoRA: {camera_lora} @ 0.6")
         unet, _ = _apply_loras(unet, _dummy_clip)
+        if _camera_lora_active:
+            LD_LORA_STACK[1] = {"on": False, "lora": "None", "guard": False, "strength": 1.0}
         _vram_print("UNet + LoRAs loaded")
 
         # -- STEP 3: VAEs + upscaler --
@@ -1797,11 +1825,14 @@ class InfiniteFlowEngine:
 
     # -- Single beat processing --
     def _process_beat(self, beat: str, current_image: Optional[torch.Tensor],
-                      beat_idx: int, base_seed: int) -> Tuple[str, str, int]:
+                      beat_idx: int, base_seed: int) -> Tuple[str, str, int, Optional[str]]:
         beat_seed = base_seed + (beat_idx - 1) * 1000
 
         # Vision Describe - only from beat 2 onward
-        if beat_idx > 1 and current_image is not None and self.use_vision:
+        if len(beat.split()) > 60:
+            # Beat is already detailed enough - skip VisionDescribe
+            scene_ctx = beat[:400]
+        elif beat_idx > 1 and current_image is not None and self.use_vision:
             print(f"   [Beat {beat_idx}] Vision Describe...")
             scene_ctx = self._vision_engine.describe(current_image)
             _vram_free()
@@ -1826,7 +1857,8 @@ class InfiniteFlowEngine:
         if len(self._scene_history) > 2:
             self._scene_history = self._scene_history[-2:]
 
-        return prompt, neg, beat_seed
+        camera_lora = _detect_camera_direction(beat)
+        return prompt, neg, beat_seed, camera_lora
 
     # -- Scene Chain mode --
     def _run_scene_chain(
@@ -1834,6 +1866,8 @@ class InfiniteFlowEngine:
         story_beats: List[str],
         seed_image_path: Optional[str] = None,
         base_seed: int = 42,
+        pre_expanded: bool = False,
+        beat_negatives: Optional[List[str]] = None,
     ) -> List[str]:
         """Generate separate clips per story beat, chain via last-frame extraction."""
         current_image: Optional[torch.Tensor] = None
@@ -1848,13 +1882,27 @@ class InfiniteFlowEngine:
                 self.bible.extract_from_description("Main Character", desc)
                 self._scene_history.append(desc)
 
+        self._prompt_engine._load()
+        self._prompt_engine.keep_loaded = True
+
         for beat_idx, beat in enumerate(story_beats, 1):
             print(f"\n[IFE] -- Beat {beat_idx}/{len(story_beats)} --")
             print(f"[IFE]   {beat[:80]}{'...' if len(beat) > 80 else ''}")
 
-            prompt, neg, beat_seed = self._process_beat(
-                beat, current_image, beat_idx, base_seed
-            )
+            if pre_expanded:
+                prompt = beat
+                if QUALITY_SUFFIX not in prompt:
+                    prompt = prompt.rstrip(".") + ". " + QUALITY_SUFFIX
+                neg = beat_negatives[beat_idx - 1] if beat_negatives and beat_idx - 1 < len(beat_negatives) else _build_neg(beat, beat)
+                beat_seed = base_seed + (beat_idx - 1) * 1000
+                self._scene_history.append(prompt[:400])
+                if len(self._scene_history) > 2:
+                    self._scene_history = self._scene_history[-2:]
+                camera_lora = _detect_camera_direction(beat)
+            else:
+                prompt, neg, beat_seed, camera_lora = self._process_beat(
+                    beat, current_image, beat_idx, base_seed
+                )
             print(f"\n  EXPANDED ({len(prompt.split())}w): {prompt[:200]}...")
 
             try:
@@ -1871,6 +1919,7 @@ class InfiniteFlowEngine:
                     use_tiled_vae=self.use_tiled_vae,
                     show_preview=self.show_previews,
                     output_prefix=f"IFE_{beat_idx:03d}",
+                    camera_lora=camera_lora,
                 )
             except torch.cuda.OutOfMemoryError:
                 _vram_free()
@@ -1888,6 +1937,7 @@ class InfiniteFlowEngine:
                     use_tiled_vae=self.use_tiled_vae,
                     show_preview=False,
                     output_prefix=f"IFE_{beat_idx:03d}_retry",
+                    camera_lora=camera_lora,
                 )
 
             dest = os.path.join(self.output_dir, f"scene_{beat_idx:03d}.mp4")
@@ -1901,6 +1951,8 @@ class InfiniteFlowEngine:
             if self.show_previews:
                 display_video(dest)
 
+        self._prompt_engine._unload()
+        self._prompt_engine.keep_loaded = False
         return self._clip_paths
 
     # -- Temporal Extend mode --
@@ -1909,6 +1961,8 @@ class InfiniteFlowEngine:
         story_beats: List[str],
         seed_image_path: Optional[str] = None,
         base_seed: int = 42,
+        pre_expanded: bool = False,
+        beat_negatives: Optional[List[str]] = None,
     ) -> List[str]:
         """
         Generate an initial clip then extend via last-frame I2V conditioning.
@@ -1930,6 +1984,9 @@ class InfiniteFlowEngine:
         total_segments = 1 + self.extensions_per_clip
         print(f"\n[IFE-TE] TEMPORAL EXTEND MODE: {total_segments} segments")
 
+        self._prompt_engine._load()
+        self._prompt_engine.keep_loaded = True
+
         for seg_idx in range(total_segments):
             is_initial = (seg_idx == 0)
             seg_seed = base_seed + seg_idx * 1000
@@ -1941,25 +1998,34 @@ class InfiniteFlowEngine:
 
             print(f"\n[IFE-TE] -- Segment {seg_idx + 1}/{total_segments} --")
 
-            if not is_initial and current_image is not None and self.use_vision:
-                scene_ctx = self._vision_engine.describe(current_image)
-                _vram_free()
+            if pre_expanded:
+                prompt = beat
+                if QUALITY_SUFFIX not in prompt:
+                    prompt = prompt.rstrip(".") + ". " + QUALITY_SUFFIX
+                neg = beat_negatives[beat_idx] if beat_negatives and beat_idx < len(beat_negatives) else _build_neg(beat, beat)
+                self._scene_history.append(prompt[:400])
+                if len(self._scene_history) > 2:
+                    self._scene_history = self._scene_history[-2:]
             else:
-                scene_ctx = self._rolling_ctx()
+                if not is_initial and current_image is not None and self.use_vision:
+                    scene_ctx = self._vision_engine.describe(current_image)
+                    _vram_free()
+                else:
+                    scene_ctx = self._rolling_ctx()
 
-            prompt, neg = self._prompt_engine.generate(
-                user_input=beat,
-                frame_count=self.frames,
-                creativity=self.creativity,
-                seed=seg_seed,
-                scene_context=scene_ctx,
-                lora_triggers=self.lora_triggers,
-                character_bible=self.bible.to_prompt_block(),
-            )
-            _vram_free()
-            self._scene_history.append(prompt[:400])
-            if len(self._scene_history) > 2:
-                self._scene_history = self._scene_history[-2:]
+                prompt, neg = self._prompt_engine.generate(
+                    user_input=beat,
+                    frame_count=self.frames,
+                    creativity=self.creativity,
+                    seed=seg_seed,
+                    scene_context=scene_ctx,
+                    lora_triggers=self.lora_triggers,
+                    character_bible=self.bible.to_prompt_block(),
+                )
+                _vram_free()
+                self._scene_history.append(prompt[:400])
+                if len(self._scene_history) > 2:
+                    self._scene_history = self._scene_history[-2:]
 
             if is_initial:
                 conditioning_image = current_image
@@ -2006,6 +2072,13 @@ class InfiniteFlowEngine:
             shutil.copy2(clip_path, dest)
             self._clip_paths.append(dest)
 
+            # Self-bootstrap anchor from first T2V clip
+            if seg_idx == 0 and anchor_samples is None:
+                bootstrapped = extract_frame_at_position(dest, fraction=0.33)
+                if bootstrapped is not None:
+                    anchor_samples = bootstrapped
+                    print(f"[IFE-TE]   Self-bootstrapped anchor from first clip (frame at 33%)")
+
             last_frame = get_last_frame_tensor(dest)
             if last_frame is not None:
                 current_image = last_frame
@@ -2015,6 +2088,8 @@ class InfiniteFlowEngine:
             if self.show_previews:
                 display_video(dest)
 
+        self._prompt_engine._unload()
+        self._prompt_engine.keep_loaded = False
         return self._clip_paths
 
     # -- SVI-Pro Extend mode (NEW) --
@@ -2023,6 +2098,8 @@ class InfiniteFlowEngine:
         story_beats: List[str],
         seed_image_path: Optional[str] = None,
         base_seed: int = 42,
+        pre_expanded: bool = False,
+        beat_negatives: Optional[List[str]] = None,
     ) -> List[str]:
         """
         Proper SVI-Pro temporal extension mode:
@@ -2053,6 +2130,9 @@ class InfiniteFlowEngine:
         print(f"[IFE-SVI]  Overlap frames: {OVERLAP_FRAMES}")
         print(f"[IFE-SVI]  Segments: {total_segments}")
         print(f"[IFE-SVI]  Adaptive strength: {USE_ADAPTIVE_STRENGTH}")
+
+        self._prompt_engine._load()
+        self._prompt_engine.keep_loaded = True
 
         for seg_idx in range(total_segments):
             is_initial = (seg_idx == 0)
@@ -2096,27 +2176,36 @@ class InfiniteFlowEngine:
                     current_image = overlap_batch[-1:, :, :, :]
                     print(f"[IFE-SVI]   Extracted {OVERLAP_FRAMES} overlap frames (using last frame for conditioning)")
 
-            # Vision describe
-            if not is_initial and current_image is not None and self.use_vision:
-                scene_ctx = self._vision_engine.describe(current_image)
-                _vram_free()
+            if pre_expanded:
+                prompt = beat
+                if QUALITY_SUFFIX not in prompt:
+                    prompt = prompt.rstrip(".") + ". " + QUALITY_SUFFIX
+                neg = beat_negatives[beat_idx] if beat_negatives and beat_idx < len(beat_negatives) else _build_neg(beat, beat)
+                self._scene_history.append(prompt[:400])
+                if len(self._scene_history) > 2:
+                    self._scene_history = self._scene_history[-2:]
             else:
-                scene_ctx = self._rolling_ctx()
+                # Vision describe
+                if not is_initial and current_image is not None and self.use_vision:
+                    scene_ctx = self._vision_engine.describe(current_image)
+                    _vram_free()
+                else:
+                    scene_ctx = self._rolling_ctx()
 
-            # Prompt generation
-            prompt, neg = self._prompt_engine.generate(
-                user_input=beat,
-                frame_count=self.frames,
-                creativity=self.creativity,
-                seed=seg_seed,
-                scene_context=scene_ctx,
-                lora_triggers=self.lora_triggers,
-                character_bible=self.bible.to_prompt_block(),
-            )
-            _vram_free()
-            self._scene_history.append(prompt[:400])
-            if len(self._scene_history) > 2:
-                self._scene_history = self._scene_history[-2:]
+                # Prompt generation
+                prompt, neg = self._prompt_engine.generate(
+                    user_input=beat,
+                    frame_count=self.frames,
+                    creativity=self.creativity,
+                    seed=seg_seed,
+                    scene_context=scene_ctx,
+                    lora_triggers=self.lora_triggers,
+                    character_bible=self.bible.to_prompt_block(),
+                )
+                _vram_free()
+                self._scene_history.append(prompt[:400])
+                if len(self._scene_history) > 2:
+                    self._scene_history = self._scene_history[-2:]
 
             # Determine conditioning for generate_clip
             if is_initial:
@@ -2173,11 +2262,20 @@ class InfiniteFlowEngine:
             prev_clip_path = dest
             prev_shot_data = current_shot_data
 
+            # Self-bootstrap anchor from first T2V clip
+            if is_initial and anchor_samples is None:
+                bootstrapped = extract_frame_at_position(dest, fraction=0.33)
+                if bootstrapped is not None:
+                    anchor_samples = bootstrapped
+                    print(f"[IFE-SVI]   Self-bootstrapped anchor from first clip (frame at 33%)")
+
             print(f"[IFE-SVI] Segment {seg_idx + 1} -> {dest}")
 
             if self.show_previews:
                 display_video(dest)
 
+        self._prompt_engine._unload()
+        self._prompt_engine.keep_loaded = False
         print(f"\n[IFE-SVI] {total_segments} segments complete.")
         return self._clip_paths
 
@@ -2228,11 +2326,14 @@ class InfiniteFlowEngine:
         # (the prompts are already expanded, so we pass them as-is)
         print(f"[IFE] Step 4: Generating clips in '{self.mode}' mode...")
         expanded_beats = [pos for pos, neg in scene_prompts]
+        expanded_negs = [neg for pos, neg in scene_prompts]
 
         return self.run(
             story_beats=expanded_beats,
             seed_image_path=seed_image_path,
             base_seed=base_seed,
+            pre_expanded=True,
+            beat_negatives=expanded_negs,
         )
 
     # -- Main run method --
@@ -2241,6 +2342,8 @@ class InfiniteFlowEngine:
         story_beats: List[str],
         seed_image_path: Optional[str] = None,
         base_seed: int = 42,
+        pre_expanded: bool = False,
+        beat_negatives: Optional[List[str]] = None,
     ) -> List[str]:
         """
         Process story beats according to the configured mode.
@@ -2258,11 +2361,11 @@ class InfiniteFlowEngine:
             print(f"[IFE]  Overlap   : {OVERLAP_FRAMES} frames")
 
         if self.mode == "svi_pro_extend":
-            return self._run_svi_pro_extend(story_beats, seed_image_path, base_seed)
+            return self._run_svi_pro_extend(story_beats, seed_image_path, base_seed, pre_expanded, beat_negatives)
         elif self.mode == "temporal_extend":
-            return self._run_temporal_extend(story_beats, seed_image_path, base_seed)
+            return self._run_temporal_extend(story_beats, seed_image_path, base_seed, pre_expanded, beat_negatives)
         else:
-            return self._run_scene_chain(story_beats, seed_image_path, base_seed)
+            return self._run_scene_chain(story_beats, seed_image_path, base_seed, pre_expanded, beat_negatives)
 
     def concat_all(self, output_name: str = "full_video.mp4") -> str:
         """Concatenate all generated clips into one final video."""

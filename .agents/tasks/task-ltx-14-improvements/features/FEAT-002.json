@@ -1,0 +1,31 @@
+{
+  "id": "FEAT-002",
+  "type": "feat",
+  "description": "Implement improvements 1, 2, 4, 5, 7 (batch LLM loading, double-expansion fix, anchor self-bootstrap, camera LoRA switching, VisionDescribe skip)",
+  "status": "in_progress",
+  "steps": [
+    "1. Improvement #1 (Batch LLM loading): In _run_scene_chain(), before the `for beat_idx, beat in enumerate(story_beats, 1):` loop, add `self._prompt_engine._load()` and `self._prompt_engine.keep_loaded = True`. After the loop ends (before return), add `self._prompt_engine._unload()` and `self._prompt_engine.keep_loaded = False`. Do the same in _run_temporal_extend() and _run_svi_pro_extend() around their generation loops.",
+    "2. Improvement #2 (Fix double-expansion): Add a `pre_expanded=False` parameter to run(). When pre_expanded=True, in the mode dispatch, modify the behavior: in _run_scene_chain, skip _process_beat() and use beat text directly as prompt with _build_neg(beat, beat) for negative. Pass pre_expanded through to the mode methods. Update run_from_story() to pass both positives and negatives: change expanded_beats to include neg from scene_prompts, store as list of (pos, neg) tuples or two parallel lists, and pass pre_expanded=True to run().",
+    "3. Improvement #4 (Self-bootstrap anchor): In _run_svi_pro_extend(), after the first segment generates successfully (after `shutil.copy2` for is_initial=True), if anchor_samples is still None, call extract_frame_at_position(dest, fraction=0.33) to get a frame and set it as anchor_samples. Do the same in _run_temporal_extend().",
+    "4. Improvement #5 (Dynamic camera LoRA): Add a function `_detect_camera_direction(beat_text: str) -> Optional[str]` that scans beat text for camera keywords. Mapping: 'dolly in'/'forward'/'push in' -> 'ltx-2-19b-lora-camera-control-dolly-in.safetensors', 'dolly out'/'pull back'/'backward' -> dolly-out, 'dolly left'/'slide left' -> dolly-left, 'dolly right'/'slide right' -> dolly-right. In generate_clip(), add optional `camera_lora: Optional[str] = None` parameter. If provided, temporarily set LD_LORA_STACK[1] to enabled with that lora filename at strength 0.6 before _apply_loras(), then reset it after. In _process_beat(), call _detect_camera_direction(beat) and return it alongside prompt/neg/seed (change return to 4-tuple).",
+    "5. Improvement #7 (Skip VisionDescribe when unnecessary): In _process_beat(), before the Vision Describe call, check word count: `if len(beat.split()) > 60: scene_ctx = beat[:400]` and skip the vision call. Add an elif for the existing vision condition."
+  ],
+  "acceptance_criteria": [
+    "_run_scene_chain, _run_temporal_extend, _run_svi_pro_extend all batch-load/unload the LLM around loops",
+    "run() accepts pre_expanded parameter; when True, skips _process_beat",
+    "run_from_story() passes pre_expanded=True and includes negatives",
+    "anchor self-bootstrap from first T2V clip exists in both svi_pro and temporal_extend",
+    "_detect_camera_direction() function exists with proper keyword mapping",
+    "generate_clip() accepts camera_lora parameter and applies it",
+    "_process_beat skips VisionDescribe for beats > 60 words"
+  ],
+  "verification": [
+    "python -c \"import ast; ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); print('AST OK')\"",
+    "grep -n 'keep_loaded' /projects/sandbox/ltx2/LTX.PY",
+    "grep -n 'pre_expanded' /projects/sandbox/ltx2/LTX.PY",
+    "grep -n '_detect_camera_direction' /projects/sandbox/ltx2/LTX.PY",
+    "grep -n 'extract_frame_at_position' /projects/sandbox/ltx2/LTX.PY | grep -v 'def '"
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

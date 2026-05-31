@@ -1,0 +1,27 @@
+{
+  "id": "FEAT-003",
+  "type": "feat",
+  "description": "VRAM & Performance improvements: CLIP conditioning caching, VisionDescribe keep_loaded option, EasyPromptEngine keep_loaded during prompt phase, TinyVAE stays loaded, graduated OOM retry strategy.",
+  "status": "in_progress",
+  "steps": [
+    "1. CLIP conditioning caching: Add a module-level dict _CLIP_COND_CACHE = {} that maps prompt strings to their encoded conditioning tensors (moved to CPU). In _load_clip_encode(), before loading CLIP check if the prompt is in the cache; if so, return cached tensors (moved back to GPU) without loading CLIP at all. After encoding, store result in cache (on CPU) before returning. Add a cache_clip_cond: bool = True param to generate_clip(). Add _clear_clip_cache() helper function.",
+    "2. VisionDescribe keep_loaded option: Add keep_loaded: bool = False to VisionDescribeEngine.__init__(). When True, store model/processor as instance attributes after first describe() call instead of deleting them. Add an explicit unload() method. In InfiniteFlowEngine, during the prompt generation phase (when processing multiple beats), set keep_loaded=True on the vision engine, then call vision_engine.unload() before the first generate_clip() call.",
+    "3. EasyPromptEngine keep_loaded during prompt phase: The keep_loaded param already exists. In InfiniteFlowEngine, add a _generate_all_prompts() method that sets self._prompt_engine.keep_loaded = True, generates prompts for ALL beats in a batch, then calls self._prompt_engine._unload() before video generation begins. This keeps LLM loaded across consecutive prompt generations. Update _run_scene_chain and _run_temporal_extend to optionally use this batch approach (add batch_prompts: bool = True to run()).",
+    "4. TinyVAE stays loaded: Instead of loading/unloading TinyVAE in every _preview() call, load it once at the start of generate_clip (after _load_comfy_nodes) into a module-level _TINY_VAE variable that persists across clips (only ~50MB). Add _load_tiny_vae() and _unload_tiny_vae() helpers. The TinyVAE is only unloaded when explicitly requested or at end of full run.",
+    "5. Graduated OOM retry: Replace the current binary OOM handler (try I2V -> catch OOM -> retry as T2V) with a graduated strategy in _generate_single_segment(). The retry sequence is: (a) retry with show_preview=False (saves TinyVAE decode memory), (b) retry with reduced tiled_tlen (temporal_tile_length // 2), (c) retry with reduced frames (frames * 0.75), (d) final: retry as T2V with reduced frames. Each step logs what mitigation was applied. Add an OOMRetryStrategy enum or list to configure this."
+  ],
+  "acceptance_criteria": [
+    "AST parse passes",
+    "_CLIP_COND_CACHE dict exists at module level",
+    "VisionDescribeEngine has keep_loaded param and unload() method",
+    "InfiniteFlowEngine has _generate_all_prompts() batch method",
+    "_TINY_VAE module-level variable and _load_tiny_vae()/_unload_tiny_vae() exist",
+    "Graduated OOM retry logic exists in _generate_single_segment with at least 4 retry steps"
+  ],
+  "verification": [
+    "python -c \"import ast; ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); print('PASS')\"",
+    "python -c \"import ast; tree=ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); names=[n.name for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef))]; assert '_clear_clip_cache' in names; assert '_load_tiny_vae' in names; assert '_generate_all_prompts' in names; print('VRAM features present')\""
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

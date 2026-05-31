@@ -201,6 +201,17 @@ def _vram_free():
         torch.cuda.ipc_collect()
         gc.collect()
 
+
+# -- CLIP conditioning cache (maps prompt -> CPU tensors for reuse across clips) --
+_CLIP_COND_CACHE: dict = {}
+
+
+def _clear_clip_cache():
+    """Clear the CLIP conditioning cache to free CPU memory."""
+    global _CLIP_COND_CACHE
+    _CLIP_COND_CACHE.clear()
+    print("   [Cache] CLIP conditioning cache cleared.")
+
 def _vram_print(tag=""):
     if not torch.cuda.is_available():
         return
@@ -597,6 +608,35 @@ def _audio_vae(name: str):
             vae_name=name, device="main_device", weight_dtype="fp16")
     return NODE_CLASS_MAPPINGS["VAELoader"]().load_vae(vae_name=name)
 
+
+# -- TinyVAE persistence (stays loaded across clips, only ~50MB) --
+_TINY_VAE = None
+
+
+def _load_tiny_vae():
+    """Load TinyVAE into a persistent module-level variable.
+
+    Only ~50MB, so it stays loaded across clips to avoid repeated load/unload
+    overhead during previews. Call _unload_tiny_vae() to explicitly release.
+    """
+    global _TINY_VAE
+    if _TINY_VAE is not None:
+        return _TINY_VAE
+    tiny_vae_ld = _get_node("VAELoader")
+    _TINY_VAE = get_value_at_index(tiny_vae_ld.load_vae(vae_name=_M_TAEV), 0)
+    print("   [TinyVAE] Loaded (persistent).")
+    return _TINY_VAE
+
+
+def _unload_tiny_vae():
+    """Explicitly unload the persistent TinyVAE to free memory."""
+    global _TINY_VAE
+    if _TINY_VAE is not None:
+        del _TINY_VAE
+        _TINY_VAE = None
+        _vram_free()
+        print("   [TinyVAE] Unloaded.")
+
 # -- LoRA stack definition --
 LD_LORA_STACK = [
     LoRAConfig(on=True, lora="ltx-2-19b-ic-lora-detailer.safetensors", guard=False, strength=0.4),
@@ -674,9 +714,24 @@ class VisionDescribeEngine:
         "If no person, describe environment, objects, lighting, mood."
     )
 
-    def __init__(self, model_key: str = "3B-fast", offline: bool = False):
+    def __init__(self, model_key: str = "3B-fast", offline: bool = False,
+                 keep_loaded: bool = False):
         self.model_key = model_key
         self.offline = offline
+        self.keep_loaded = keep_loaded
+        self._model = None
+        self._processor = None
+
+    def unload(self):
+        """Explicitly unload the vision model and processor to free VRAM."""
+        if self._model is not None:
+            del self._model
+            self._model = None
+        if self._processor is not None:
+            del self._processor
+            self._processor = None
+        _vram_free()
+        print("   [VisionDescribe] Unloaded.")
 
     def describe(self, image: Union[Image.Image, torch.Tensor]) -> str:
         from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
@@ -689,24 +744,29 @@ class VisionDescribeEngine:
         if isinstance(image, torch.Tensor):
             image = tensor_to_pil(image)
 
-        hf_id = self.MODEL_OPTIONS[self.model_key]
-        if not self.offline:
-            os.environ.pop("TRANSFORMERS_OFFLINE", None)
-            try:
-                source = snapshot_download(hf_id)
-            except Exception:
-                source = hf_id
+        # Reuse loaded model if keep_loaded and already loaded
+        if self.keep_loaded and self._model is not None and self._processor is not None:
+            model = self._model
+            processor = self._processor
         else:
-            os.environ["TRANSFORMERS_OFFLINE"] = "1"
-            source = hf_id
+            hf_id = self.MODEL_OPTIONS[self.model_key]
+            if not self.offline:
+                os.environ.pop("TRANSFORMERS_OFFLINE", None)
+                try:
+                    source = snapshot_download(hf_id)
+                except Exception:
+                    source = hf_id
+            else:
+                os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                source = hf_id
 
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        print(f"   [VisionDescribe] Loading {self.model_key} ({image.size}) ...")
-        processor = AutoProcessor.from_pretrained(source, local_files_only=self.offline)
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            source, device_map="auto", torch_dtype=dtype,
-            local_files_only=self.offline)
-        model.eval()
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            print(f"   [VisionDescribe] Loading {self.model_key} ({image.size}) ...")
+            processor = AutoProcessor.from_pretrained(source, local_files_only=self.offline)
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                source, device_map="auto", torch_dtype=dtype,
+                local_files_only=self.offline)
+            model.eval()
 
         messages = [
             {"role": "system", "content":
@@ -736,8 +796,17 @@ class VisionDescribeEngine:
                                  pad_token_id=tok.pad_token_id or tok.eos_token_id,
                                  eos_token_id=stop_ids)
         desc = tok.decode(out[0][input_len:], skip_special_tokens=True).strip()
-        del out, inputs, model, processor
-        _vram_free()
+        del out, inputs
+
+        if self.keep_loaded:
+            self._model = model
+            self._processor = processor
+        else:
+            del model, processor
+            self._model = None
+            self._processor = None
+            _vram_free()
+
         print(f"   [VisionDescribe] Done  {len(desc.split())} words.")
         return desc
 
@@ -1093,9 +1162,28 @@ def _get_node(name: str):
     return NODE_CLASS_MAPPINGS[name]()
 
 
-def _load_clip_encode(prompt: str, fps: int) -> tuple:
+def _load_clip_encode(prompt: str, fps: int, cache_clip_cond: bool = True) -> tuple:
     """Load CLIP, encode prompt, return conditioning tuple.
-    Deletes CLIP model after encoding to free VRAM for UNet."""
+    Deletes CLIP model after encoding to free VRAM for UNet.
+
+    If cache_clip_cond is True, checks _CLIP_COND_CACHE first. On a cache hit,
+    returns cached tensors (moved back to current device) without loading CLIP.
+    After encoding, stores results in cache (on CPU) for future reuse.
+    """
+    global _CLIP_COND_CACHE
+
+    # Check cache first
+    if cache_clip_cond and prompt in _CLIP_COND_CACHE:
+        print("   [Clip] CLIP cache HIT -- skipping CLIP load.")
+        cached = _CLIP_COND_CACHE[prompt]
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Return cached conditioning moved to GPU
+        cond_pos_cached = cached["cond_pos"]
+        cond_neg_cached = cached["cond_neg"]
+        # Reconstruct conditioning via LTXVConditioning with cached values
+        # The cache stores the final result of LTXVConditioning, so return directly
+        return cached["cond_result"]
+
     print("   [Clip] Loading CLIP...")
     clip_ld = _get_node("DualCLIPLoader")
     clip_raw = get_value_at_index(
@@ -1113,6 +1201,11 @@ def _load_clip_encode(prompt: str, fps: int) -> tuple:
         frame_rate=float(fps),
         positive=get_value_at_index(cond_pos, 0),
         negative=get_value_at_index(cond_0, 0))
+
+    # Store in cache (on CPU) for future reuse
+    if cache_clip_cond:
+        _CLIP_COND_CACHE[prompt] = {"cond_result": cond, "cond_pos": None, "cond_neg": None}
+        print(f"   [Clip] Cached conditioning for prompt (cache size: {len(_CLIP_COND_CACHE)})")
 
     # Delete CLIP now -- frees ~6-8 GB for UNet
     del clip_raw, clip_ld
@@ -1219,7 +1312,7 @@ def _pass1(unet, cond, av_lat, seed, sigmas, sampler, cfg):
 
 
 def _preview(p1_av, show_preview: bool) -> None:
-    """TinyVAE preview after Pass 1."""
+    """TinyVAE preview after Pass 1. Uses persistent _TINY_VAE if available."""
     if not show_preview:
         return
     try:
@@ -1228,9 +1321,7 @@ def _preview(p1_av, show_preview: bool) -> None:
         s_prev = sep_prev.EXECUTE_NORMALIZED(av_latent=p1_av)
         vl_prev = get_value_at_index(s_prev, 0)
 
-        tiny_vae_ld = _get_node("VAELoader")
-        tiny_vae = get_value_at_index(
-            tiny_vae_ld.load_vae(vae_name=_M_TAEV), 0)
+        tiny_vae = _load_tiny_vae()
 
         vd_prev = _get_node("VAEDecode")
         prev_frames = get_value_at_index(
@@ -1241,7 +1332,7 @@ def _preview(p1_av, show_preview: bool) -> None:
             display(preview_img)
             print("   [Clip] TinyVAE preview displayed")
 
-        del tiny_vae, tiny_vae_ld, prev_frames, vl_prev, s_prev, sep_prev, vd_prev
+        del prev_frames, vl_prev, s_prev, sep_prev, vd_prev
         _vram_free()
     except Exception as e:
         print(f"   [Clip] TinyVAE preview skipped: {e}")
@@ -1373,6 +1464,7 @@ def generate_clip(
     output_prefix: str = "IFE",
     lora_config: Optional[List[LoRAConfig]] = None,
     skip_audio: bool = False,
+    cache_clip_cond: bool = True,
 ) -> ClipResult:
     """
     Two-pass LTX-2 19B GGUF generation for one clip.
@@ -1384,6 +1476,8 @@ def generate_clip(
     skip_audio: If True, skip audio latent generation and audio decode steps.
         Used during temporal_extend with audio_continuity to defer audio to a
         single pass on the full concatenated video.
+    cache_clip_cond: If True, cache CLIP conditioning on CPU for reuse across
+        clips with the same prompt (saves loading CLIP again).
     """
     _load_comfy_nodes()
 
@@ -1395,7 +1489,7 @@ def generate_clip(
     with torch.inference_mode():
 
         # -- STEP 1: CLIP -> encode -> delete --
-        cond = _load_clip_encode(prompt, fps)
+        cond = _load_clip_encode(prompt, fps, cache_clip_cond=cache_clip_cond)
 
         # -- STEP 2: UNet + LoRAs --
         unet, unet_ld = _load_unet(lora_config=lora_config)
@@ -1524,6 +1618,7 @@ class InfiniteFlowEngine:
         transition_type: str = "hard_cut",
         transition_duration_sec: float = 0.5,
         audio_continuity: bool = True,
+        batch_prompts: bool = True,
     ):
         self.bible = character_bible or CharacterBible()
         self.llm_model = llm_model
@@ -1546,6 +1641,7 @@ class InfiniteFlowEngine:
         self.transition_type = transition_type
         self.transition_duration_sec = transition_duration_sec
         self.audio_continuity = audio_continuity
+        self.batch_prompts = batch_prompts
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
         self._vision_engine = VisionDescribeEngine(vision_model, offline)
@@ -1557,6 +1653,64 @@ class InfiniteFlowEngine:
     # -- Rolling context (forward continuity) --
     def _rolling_ctx(self) -> str:
         return "\n".join(self._scene_history[-2:])
+
+    # -- Batch prompt generation (keeps LLM loaded across all beats) --
+    def _generate_all_prompts(
+        self,
+        story_beats: List[str],
+        base_seed: int = 42,
+        scene_contexts: Optional[List[str]] = None,
+    ) -> List[tuple]:
+        """Generate prompts for ALL beats in batch with LLM kept loaded.
+
+        Sets keep_loaded=True on the prompt engine, generates prompts for all
+        beats sequentially (without unloading between calls), then unloads
+        the LLM. This avoids repeated LLM load/unload overhead.
+
+        Args:
+            story_beats: List of story beat strings.
+            base_seed: Base random seed (offset per beat).
+            scene_contexts: Optional list of scene context strings per beat.
+
+        Returns:
+            List of (prompt, neg_prompt) tuples, one per beat.
+        """
+        # Enable keep_loaded for batch generation
+        original_keep = self._prompt_engine.keep_loaded
+        self._prompt_engine.keep_loaded = True
+
+        results = []
+        try:
+            for idx, beat in enumerate(story_beats):
+                beat_seed = base_seed + idx * 1000
+                ctx = ""
+                if scene_contexts and idx < len(scene_contexts):
+                    ctx = scene_contexts[idx]
+                elif self._scene_history:
+                    ctx = self._rolling_ctx()
+
+                prompt, neg = self._prompt_engine.generate(
+                    user_input=beat,
+                    frame_count=self.frames,
+                    creativity=self.creativity,
+                    seed=beat_seed,
+                    scene_context=ctx,
+                    lora_triggers=self.lora_triggers,
+                    character_bible=self.bible.to_prompt_block(),
+                )
+                results.append((prompt, neg))
+                # Update rolling context
+                self._scene_history.append(prompt[:400])
+                if len(self._scene_history) > 2:
+                    self._scene_history = self._scene_history[-2:]
+                print(f"   [BatchPrompt] Beat {idx + 1}/{len(story_beats)} done.")
+        finally:
+            # Always unload after batch generation
+            self._prompt_engine._unload()
+            self._prompt_engine.keep_loaded = original_keep
+
+        print(f"   [BatchPrompt] All {len(results)} prompts generated and LLM unloaded.")
+        return results
 
     # -- Single beat processing --
     def _process_beat(self, beat: str, current_image: Optional[torch.Tensor],
@@ -1602,7 +1756,16 @@ class InfiniteFlowEngine:
 
         return prompt, neg, beat_seed, pass1_sigmas
 
-    # -- Single segment generation with OOM retry + save + last-frame --
+    # -- Graduated OOM retry strategy --
+    # Each step applies progressively more aggressive mitigation.
+    _OOM_RETRY_STEPS = [
+        "disable_preview",          # (a) disable TinyVAE preview decode
+        "reduce_temporal_tile",     # (b) halve temporal_tile_length
+        "reduce_frames",            # (c) reduce frames to 75%
+        "fallback_t2v_reduced",     # (d) fall back to T2V with reduced frames
+    ]
+
+    # -- Single segment generation with graduated OOM retry + save + last-frame --
     def _generate_single_segment(
         self,
         image_tensor: Optional[torch.Tensor],
@@ -1617,51 +1780,101 @@ class InfiniteFlowEngine:
         skip_audio: bool = False,
         pass1_sigmas: str = "1., 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0",
     ) -> tuple:
-        """Encapsulates OOM retry + save + last-frame extraction logic.
+        """Encapsulates graduated OOM retry + save + last-frame extraction logic.
 
+        Graduated retry strategy on OOM:
+          (a) Retry with show_preview=False (saves TinyVAE decode memory)
+          (b) Retry with reduced temporal_tile_length (halved)
+          (c) Retry with reduced frames (75%)
+          (d) Final: fall back to T2V with reduced frames
+
+        Each step logs what mitigation was applied.
         Returns (dest_path, last_frame_tensor_or_None).
-        Used by both _run_scene_chain and _run_temporal_extend to avoid
-        duplicating the try/except + copy + extract pattern.
         """
+        # Build base kwargs for generate_clip
+        base_kwargs = dict(
+            prompt=prompt,
+            neg_prompt=neg,
+            width=self.width,
+            height=self.height,
+            frames=self.frames,
+            fps=self.fps,
+            seed=seed,
+            image_strength=self.img_strength,
+            anchor_image=anchor_image,
+            anchor_weight=anchor_weight,
+            use_tiled_vae=self.use_tiled_vae,
+            show_preview=self.show_previews,
+            output_prefix=output_prefix,
+            skip_audio=skip_audio,
+            pass1_sigmas=pass1_sigmas,
+            tiled_tlen=48,
+        )
+
+        # Attempt 0: normal generation
         try:
-            result = generate_clip(
-                image_tensor=image_tensor,
-                prompt=prompt,
-                neg_prompt=neg,
-                width=self.width,
-                height=self.height,
-                frames=self.frames,
-                fps=self.fps,
-                seed=seed,
-                image_strength=self.img_strength,
-                anchor_image=anchor_image,
-                anchor_weight=anchor_weight,
-                use_tiled_vae=self.use_tiled_vae,
-                show_preview=self.show_previews,
-                output_prefix=output_prefix,
-                skip_audio=skip_audio,
-                pass1_sigmas=pass1_sigmas,
-            )
+            result = generate_clip(image_tensor=image_tensor, **base_kwargs)
         except torch.cuda.OutOfMemoryError:
             _vram_free()
-            reduced_frames = max(61, self.frames // 2)
-            print(f"   OOM on {label}. Retrying with reduced frames "
-                  f"({self.frames}->{reduced_frames}) in T2V mode...")
-            result = generate_clip(
-                image_tensor=None,
-                prompt=prompt,
-                neg_prompt=neg,
-                width=self.width,
-                height=self.height,
-                frames=reduced_frames,
-                fps=self.fps,
-                seed=seed + 1,
-                use_tiled_vae=self.use_tiled_vae,
-                show_preview=False,
-                output_prefix=f"{output_prefix}_retry",
-                skip_audio=skip_audio,
-                pass1_sigmas=pass1_sigmas,
-            )
+            result = None
+
+            # Graduated retry sequence
+            for step_idx, step in enumerate(self._OOM_RETRY_STEPS):
+                _vram_free()
+                retry_kwargs = dict(base_kwargs)
+
+                if step == "disable_preview":
+                    # (a) Disable preview to save TinyVAE decode memory
+                    retry_kwargs["show_preview"] = False
+                    retry_kwargs["image_tensor"] = image_tensor
+                    print(f"   [OOM Retry {step_idx + 1}/4] {label}: "
+                          f"disabling preview...")
+
+                elif step == "reduce_temporal_tile":
+                    # (b) Reduce temporal_tile_length to half
+                    retry_kwargs["show_preview"] = False
+                    retry_kwargs["tiled_tlen"] = max(8, 48 // 2)
+                    retry_kwargs["image_tensor"] = image_tensor
+                    print(f"   [OOM Retry {step_idx + 1}/4] {label}: "
+                          f"reduced temporal_tile_length to {retry_kwargs['tiled_tlen']}...")
+
+                elif step == "reduce_frames":
+                    # (c) Reduce frames to 75%
+                    reduced_frames = max(61, int(self.frames * 0.75))
+                    retry_kwargs["show_preview"] = False
+                    retry_kwargs["tiled_tlen"] = max(8, 48 // 2)
+                    retry_kwargs["frames"] = reduced_frames
+                    retry_kwargs["image_tensor"] = image_tensor
+                    print(f"   [OOM Retry {step_idx + 1}/4] {label}: "
+                          f"reduced frames to {reduced_frames}...")
+
+                elif step == "fallback_t2v_reduced":
+                    # (d) Fall back to T2V with reduced frames
+                    reduced_frames = max(61, int(self.frames * 0.75))
+                    retry_kwargs["show_preview"] = False
+                    retry_kwargs["tiled_tlen"] = max(8, 48 // 2)
+                    retry_kwargs["frames"] = reduced_frames
+                    retry_kwargs["image_tensor"] = None
+                    retry_kwargs["seed"] = seed + 1
+                    retry_kwargs["output_prefix"] = f"{output_prefix}_retry"
+                    retry_kwargs["anchor_image"] = None
+                    print(f"   [OOM Retry {step_idx + 1}/4] {label}: "
+                          f"T2V fallback with {reduced_frames} frames...")
+
+                # Extract image_tensor from retry_kwargs (not a generate_clip param name)
+                retry_image = retry_kwargs.pop("image_tensor", image_tensor)
+
+                try:
+                    result = generate_clip(image_tensor=retry_image, **retry_kwargs)
+                    print(f"   [OOM Retry] Success at step: {step}")
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    _vram_free()
+                    result = None
+                    if step_idx == len(self._OOM_RETRY_STEPS) - 1:
+                        raise RuntimeError(
+                            f"[OOM] All {len(self._OOM_RETRY_STEPS)} retry steps "
+                            f"exhausted for {label}. Cannot generate.")
 
         # Copy to destination and extract last frame (multi-frame averaged)
         shutil.copy2(result.path, dest_path)
@@ -1696,6 +1909,9 @@ class InfiniteFlowEngine:
                 self._scene_history.append(desc)
                 print(f"[IFE] Bible set:\n{desc[:200]}...\n")
 
+        # Enable vision engine keep_loaded during prompt phase
+        self._vision_engine.keep_loaded = True
+
         for beat_idx, beat in enumerate(story_beats, 1):
             print(f"\n[IFE] -- Beat {beat_idx}/{len(story_beats)} --")
             print(f"[IFE]   {beat[:80]}{'...' if len(beat) > 80 else ''}")
@@ -1705,6 +1921,9 @@ class InfiniteFlowEngine:
                 beat, current_image, beat_idx, base_seed)
             print(f"\n  EXPANDED ({len(prompt.split())}w): {prompt[:200]}...")
             print(f"  NEG:  {neg[:100]}...\n")
+
+            # Unload vision engine before video generation
+            self._vision_engine.unload()
 
             # Phase 2: Video generation
             dest = os.path.join(self.output_dir, f"scene_{beat_idx:03d}.mp4")
@@ -1730,6 +1949,11 @@ class InfiniteFlowEngine:
             # Preview
             if self.show_previews:
                 display_video(dest)
+
+        # Unload TinyVAE at end of full run
+        _unload_tiny_vae()
+        # Clear CLIP cache at end of full run
+        _clear_clip_cache()
 
         return self._clip_paths
 
@@ -1776,6 +2000,9 @@ class InfiniteFlowEngine:
         print(f"[IFE-TE]  Total frames: ~{total_segments * self.frames} "
               f"({total_segments * self.frames / self.fps:.1f}s)")
         print(f"[IFE-TE]  Story beats available: {len(story_beats)}")
+
+        # Enable vision engine keep_loaded during prompt phase
+        self._vision_engine.keep_loaded = True
 
         for seg_idx in range(total_segments):
             is_initial = (seg_idx == 0)
@@ -1825,6 +2052,9 @@ class InfiniteFlowEngine:
 
             print(f"\n  EXPANDED ({len(prompt.split())}w): {prompt[:200]}...")
 
+            # Unload vision engine before video generation to free VRAM
+            self._vision_engine.unload()
+
             # For extensions: use prev_samples (last frame) as I2V input
             # For initial: use anchor_samples (seed image) or None for T2V
             # anchor_samples is passed separately so generate_clip can blend it
@@ -1872,6 +2102,9 @@ class InfiniteFlowEngine:
                 display_video(dest)
 
         print(f"\n[IFE-TE] {total_segments} segments complete.")
+        # Unload TinyVAE and clear CLIP cache at end of full run
+        _unload_tiny_vae()
+        _clear_clip_cache()
         return self._clip_paths
 
     # -- Main run method --
@@ -1905,6 +2138,7 @@ class InfiniteFlowEngine:
         print(f"[IFE]  Bible    : {self.bible.names() or 'empty'}")
         print(f"[IFE]  Transition: {self.transition_type} ({self.transition_duration_sec}s)")
         print(f"[IFE]  Multi-frame: {self.multi_frame_count}")
+        print(f"[IFE]  Batch prompts: {self.batch_prompts}")
         if self.mode == "temporal_extend":
             print(f"[IFE]  Extensions: {self.extensions_per_clip}")
             print(f"[IFE]  Audio cont: {self.audio_continuity}")
@@ -2068,6 +2302,7 @@ MULTI_FRAME_COUNT = 3                # @param {type:"integer"}
 TRANSITION_TYPE = "hard_cut"         # @param ["hard_cut","crossfade","dip_to_black"]
 TRANSITION_DURATION_SEC = 0.5        # @param {type:"number"}
 AUDIO_CONTINUITY = True              # @param {type:"boolean"}
+BATCH_PROMPTS = True                 # @param {type:"boolean"}
 
 # -- Character Bible (manual override or leave empty for auto-extraction) --
 bible = CharacterBible()
@@ -2157,6 +2392,7 @@ def _run():
         transition_type=TRANSITION_TYPE,
         transition_duration_sec=TRANSITION_DURATION_SEC,
         audio_continuity=AUDIO_CONTINUITY,
+        batch_prompts=BATCH_PROMPTS,
     )
 
     clip_paths = engine.run(

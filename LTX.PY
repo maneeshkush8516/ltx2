@@ -40,26 +40,85 @@ _pip("av spandrel albumentations onnx opencv-python onnxruntime")
 _pip("imageio imageio-ffmpeg")
 _pip('"transformers>=4.43.0" accelerate qwen-vl-utils huggingface_hub')
 
-# Pinned ComfyUI build
-_shell("git clone --branch ComfyUI_22_01_2026_v0.10.0 https://github.com/Isi-dev/ComfyUI.git")
+# Pinned ComfyUI build (skip if already cloned)
+if not os.path.isdir("/content/ComfyUI"):
+    try:
+        _shell("git clone --branch ComfyUI_22_01_2026_v0.10.0 https://github.com/Isi-dev/ComfyUI.git")
+        print("   ComfyUI cloned (pinned branch)")
+    except subprocess.CalledProcessError:
+        try:
+            _shell("git clone https://github.com/Isi-dev/ComfyUI.git")
+            print("   ComfyUI cloned (default branch from Isi-dev)")
+        except subprocess.CalledProcessError:
+            _shell("git clone https://github.com/comfyanonymous/ComfyUI.git")
+            print("   ComfyUI cloned (official repo, default branch)")
+else:
+    print("   ComfyUI already exists, skipping clone")
+
 _shell("pip install -r /content/ComfyUI/requirements.txt -q")
 clear_output()
 
 os.chdir("/content/ComfyUI/custom_nodes")
 
 # Pinned custom nodes
-_shell("git clone --branch kj_1.2.6               https://github.com/Isi-dev/ComfyUI_KJNodes")
-_shell("git clone --branch ComfyUI_GGUF_22_01_2026 https://github.com/Isi-dev/ComfyUI_GGUF.git")
+if not os.path.isdir("/content/ComfyUI/custom_nodes/ComfyUI_KJNodes"):
+    try:
+        _shell("git clone --branch kj_1.2.6 https://github.com/Isi-dev/ComfyUI_KJNodes")
+        print("   ComfyUI_KJNodes cloned (pinned branch)")
+    except subprocess.CalledProcessError:
+        _shell("git clone https://github.com/Isi-dev/ComfyUI_KJNodes")
+        print("   ComfyUI_KJNodes cloned (default branch)")
+else:
+    print("   ComfyUI_KJNodes already exists, skipping clone")
+
+if not os.path.isdir("/content/ComfyUI/custom_nodes/ComfyUI_GGUF"):
+    try:
+        _shell("git clone --branch ComfyUI_GGUF_22_01_2026 https://github.com/Isi-dev/ComfyUI_GGUF.git")
+        print("   ComfyUI_GGUF cloned (pinned branch)")
+    except subprocess.CalledProcessError:
+        _shell("git clone https://github.com/Isi-dev/ComfyUI_GGUF.git")
+        print("   ComfyUI_GGUF cloned (default branch)")
+else:
+    print("   ComfyUI_GGUF already exists, skipping clone")
 
 # Official LTX nodes (tiled VAE + AV latent helpers)
-_shell("git clone https://github.com/Lightricks/ComfyUI-LTXVideo.git")
+if not os.path.isdir("/content/ComfyUI/custom_nodes/ComfyUI-LTXVideo"):
+    try:
+        _shell("git clone https://github.com/Lightricks/ComfyUI-LTXVideo.git")
+        print("   ComfyUI-LTXVideo cloned")
+    except subprocess.CalledProcessError:
+        print("   WARNING: Failed to clone ComfyUI-LTXVideo")
+else:
+    print("   ComfyUI-LTXVideo already exists, skipping clone")
 
 # LoRa Daddy nodes (Master Loader + Easy Prompt as ComfyUI nodes)
-_shell("git clone https://github.com/seanhan19911990-source/LTX2EasyPrompt-LD.git")
-_shell("git clone https://github.com/seanhan19911990-source/LTX2-Master-Loader.git")
+if not os.path.isdir("/content/ComfyUI/custom_nodes/LTX2EasyPrompt-LD"):
+    try:
+        _shell("git clone https://github.com/seanhan19911990-source/LTX2EasyPrompt-LD.git")
+        print("   LTX2EasyPrompt-LD cloned")
+    except subprocess.CalledProcessError:
+        print("   WARNING: Failed to clone LTX2EasyPrompt-LD")
+else:
+    print("   LTX2EasyPrompt-LD already exists, skipping clone")
+
+if not os.path.isdir("/content/ComfyUI/custom_nodes/LTX2-Master-Loader"):
+    try:
+        _shell("git clone https://github.com/seanhan19911990-source/LTX2-Master-Loader.git")
+        print("   LTX2-Master-Loader cloned")
+    except subprocess.CalledProcessError:
+        print("   WARNING: Failed to clone LTX2-Master-Loader")
+else:
+    print("   LTX2-Master-Loader already exists, skipping clone")
 
 # Video helper suite
-_shell("git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git")
+if not os.path.isdir("/content/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite"):
+    try:
+        _shell("git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git")
+        print("   ComfyUI-VideoHelperSuite cloned")
+    except subprocess.CalledProcessError:
+        print("   WARNING: Failed to clone ComfyUI-VideoHelperSuite")
+else:
+    print("   ComfyUI-VideoHelperSuite already exists, skipping clone")
 
 # Install node requirements
 os.chdir("/content/ComfyUI/custom_nodes/ComfyUI_KJNodes")

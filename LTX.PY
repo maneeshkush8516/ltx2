@@ -102,8 +102,12 @@ def _dl(url: str, dest: str, filename: str = None) -> str:
            "-c", "-x", "16", "-s", "16", "-k", "1M", "-d", dest, "-o", fn, url]
     print(f"  dl {fn}...", end=" ", flush=True)
     r = subprocess.run(cmd, capture_output=True, text=True)
-    print("done." if r.returncode == 0 else f"FAILED: {r.stderr.strip()}")
-    return fn if r.returncode == 0 else None
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"Download failed for {fn}: {r.stderr.strip() or 'unknown error'}. "
+            f"Check network connection and re-run Cell 2.")
+    print("done.")
+    return fn
 
 KIJAI   = "https://huggingface.co/Kijai/LTXV2_comfy/resolve/main"
 CORG    = "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files"
@@ -768,6 +772,8 @@ def generate_clip(
     fps: int = 25,
     seed: int = 42,
     image_strength: float = 1.0,
+    anchor_image: Optional[torch.Tensor] = None,
+    anchor_weight: float = 0.25,
     pass1_sigmas: str = "1., 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0",
     pass1_sampler: str = "euler",
     pass1_cfg: float = 1.0,
@@ -788,6 +794,14 @@ def generate_clip(
     T4-safe: CLIP is deleted before UNet loads; UNet is deleted before decode.
     Supports I2V via LTXVImgToVideoInplace and TinyVAE preview after Pass 1.
     Supports up to 768x768 resolution and 480 frames.
+
+    anchor_image: Optional tensor of the original seed image. When provided
+        alongside image_tensor (prev_samples), the two are blended in pixel
+        space using anchor_weight before I2V conditioning. This prevents
+        temporal drift in long extension sequences by maintaining a
+        gravitational pull toward the original appearance.
+    anchor_weight: Blend factor for anchor_image (0.0 = pure prev_samples,
+        1.0 = pure anchor). Default 0.25 provides subtle consistency.
     """
     _load_comfy_nodes()
 
@@ -803,19 +817,17 @@ def generate_clip(
         # -- STEP 1: CLIP -> encode -> delete --
         print("   [Clip] Loading CLIP...")
         clip_ld = NODE_CLASS_MAPPINGS["DualCLIPLoader"]()
-        try:
-            clip_raw = get_value_at_index(
-                clip_ld.load_clip(clip_name1=_M_CLIP1, clip_name2=_M_CLIP2,
-                                  type="ltxv", device="default"), 0)
-        except Exception as e:
-            print(f"   fp4 failed ({e}), trying fp8...")
-            fp8 = "gemma_3_12B_it_fp8_scaled.safetensors"
-            clip_raw = get_value_at_index(
-                clip_ld.load_clip(clip_name1=fp8, clip_name2=_M_CLIP2,
-                                  type="ltxv", device="default"), 0)
+        clip_raw = get_value_at_index(
+            clip_ld.load_clip(clip_name1=_M_CLIP1, clip_name2=_M_CLIP2,
+                              type="ltxv", device="default"), 0)
 
         cte = NODE_CLASS_MAPPINGS["CLIPTextEncode"]()
         cond_pos = cte.encode(text=prompt, clip=clip_raw)
+        # NOTE: neg_prompt is intentionally NOT encoded here. The GGUF distilled
+        # model runs at CFG=1.0 which requires zeroed-out negative conditioning
+        # (not text-encoded negatives). The neg_prompt parameter and _build_neg()
+        # are retained for future use if CFG>1 models are supported, and for
+        # documentation of what the negative would contain.
         zero_out = NODE_CLASS_MAPPINGS["ConditioningZeroOut"]()
         cond_0 = zero_out.zero_out(conditioning=get_value_at_index(cond_pos, 0))
         ltxv_cn = NODE_CLASS_MAPPINGS["LTXVConditioning"]()
@@ -859,10 +871,20 @@ def generate_clip(
         vid_lat = eltxv.EXECUTE_NORMALIZED(width=hw, height=hh, length=frames, batch_size=1)
 
         # I2V: condition the latent on the seed/last-frame image via LTXVImgToVideoInplace
+        # When anchor_image is provided (temporal extension), blend it with
+        # image_tensor (prev_samples) for visual consistency across extensions.
         if not img_bypass:
+            conditioning_img = image_tensor
+            if anchor_image is not None:
+                # Blend anchor with prev_samples in pixel space to prevent drift
+                # anchor_weight controls how much the original appearance influences
+                conditioning_img = (
+                    (1.0 - anchor_weight) * image_tensor + anchor_weight * anchor_image
+                )
+
             rim2 = NODE_CLASS_MAPPINGS["ResizeImageMaskNode"]()
             ri2 = rim2.EXECUTE_NORMALIZED(
-                input=image_tensor, scale_method="lanczos",
+                input=conditioning_img, scale_method="lanczos",
                 resize_type={"resize_type": "scale dimensions",
                              "width": hw * 2, "height": hh * 2, "crop": "center"})
             ppn = NODE_CLASS_MAPPINGS["LTXVPreprocess"]()
@@ -1180,17 +1202,19 @@ class InfiniteFlowEngine:
                 )
             except torch.cuda.OutOfMemoryError:
                 _vram_free()
-                print(f"   OOM on beat {beat_idx}. Retrying in T2V mode...")
+                reduced_frames = max(61, self.frames // 2)
+                print(f"   OOM on beat {beat_idx}. Retrying with reduced frames "
+                      f"({self.frames}->{reduced_frames}) in T2V mode...")
                 clip_path = generate_clip(
                     image_tensor=None,
                     prompt=prompt,
                     neg_prompt=neg,
                     width=self.width,
                     height=self.height,
-                    frames=self.frames,
+                    frames=reduced_frames,
                     fps=self.fps,
                     seed=beat_seed + 1,
-                    use_tiled_vae=False,
+                    use_tiled_vae=self.use_tiled_vae,
                     show_preview=False,
                     output_prefix=f"IFE_{beat_idx:03d}_retry",
                 )
@@ -1302,11 +1326,16 @@ class InfiniteFlowEngine:
 
             # For extensions: use prev_samples (last frame) as I2V input
             # For initial: use anchor_samples (seed image) or None for T2V
+            # anchor_samples is passed separately so generate_clip can blend it
+            # with prev_samples for visual consistency across extensions.
             if is_initial:
                 conditioning_image = current_image
+                clip_anchor = None  # No blending needed for initial clip
             else:
                 # prev_samples: last frame from previous clip for I2V conditioning
                 conditioning_image = current_image
+                # anchor_samples provides gravitational pull toward original appearance
+                clip_anchor = anchor_samples
 
             # Generate the segment
             try:
@@ -1320,23 +1349,27 @@ class InfiniteFlowEngine:
                     fps=self.fps,
                     seed=seg_seed,
                     image_strength=self.img_strength,
+                    anchor_image=clip_anchor,
+                    anchor_weight=0.25,
                     use_tiled_vae=self.use_tiled_vae,
                     show_preview=self.show_previews,
                     output_prefix=f"IFE_TE_{seg_idx + 1:03d}",
                 )
             except torch.cuda.OutOfMemoryError:
                 _vram_free()
-                print(f"   OOM on segment {seg_idx + 1}. Retrying T2V...")
+                reduced_frames = max(61, self.frames // 2)
+                print(f"   OOM on segment {seg_idx + 1}. Retrying with reduced frames "
+                      f"({self.frames}->{reduced_frames}) in T2V mode...")
                 clip_path = generate_clip(
                     image_tensor=None,
                     prompt=prompt,
                     neg_prompt=neg,
                     width=self.width,
                     height=self.height,
-                    frames=self.frames,
+                    frames=reduced_frames,
                     fps=self.fps,
                     seed=seg_seed + 1,
-                    use_tiled_vae=False,
+                    use_tiled_vae=self.use_tiled_vae,
                     show_preview=False,
                     output_prefix=f"IFE_TE_{seg_idx + 1:03d}_retry",
                 )

@@ -2,7 +2,7 @@
   "id": "FEAT-004",
   "type": "feat",
   "description": "Character Consistency improvements: Bible drift detection, structured bible parsing, multi-character support, and latent-space anchor blending option.",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "1. Bible drift detection: Add a method validate_bible(self, current_frame: torch.Tensor, vision_engine: VisionDescribeEngine) -> dict to CharacterBible that runs VisionDescribe on the current frame, compares key attributes (hair color, skin tone, clothing) against stored bible entries, and returns a drift report dict with {character_name: {attribute: (expected, observed, drifted: bool)}}. Add a drift_check_interval: int = 3 param to InfiniteFlowEngine. In _run_scene_chain/_run_temporal_extend, every drift_check_interval beats, call bible.validate_bible() and log warnings if drift detected.",
     "2. Structured bible parsing: Add a method parse_structured(self, name: str, description: str) -> dict to CharacterBible that uses regex patterns to extract structured fields from VisionDescribe output: age (regex for numbers near 'year' or 'old'), hair_color (regex for color words near 'hair'), skin_tone (regex for ethnicity/skin descriptors), clothing (sentences containing clothing keywords), build (body type keywords). Store both _raw and _structured in the character entry. Update to_prompt_block() to emit structured fields when available.",
@@ -23,5 +23,5 @@
     "python -c \"import ast; tree=ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); names=[n.name for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef))]; assert 'validate_bible' in names; assert 'parse_structured' in names; assert 'describe_characters' in names; assert '_slerp' in names; print('Character consistency features present')\""
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "All four sub-features implemented: (1) validate_bible() with regex-based drift detection for hair_color, skin_tone, clothing, (2) parse_structured() extracting age, hair_color, skin_tone, clothing, build via regex, (3) describe_characters() on VisionDescribeEngine with numbered-list splitting for multi-person detection, (4) _slerp() helper and blend_mode='latent_slerp' option in generate_clip. drift_check_interval=3 added to InfiniteFlowEngine. Both _run_scene_chain and _run_temporal_extend use describe_characters for seed image and run drift checks at configured intervals."
 }

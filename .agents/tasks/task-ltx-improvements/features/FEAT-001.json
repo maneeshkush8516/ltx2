@@ -1,0 +1,29 @@
+{
+  "id": "FEAT-001",
+  "type": "refactor",
+  "description": "Code Architecture improvements: Add dataclasses (LoRAConfig, ClipResult), split generate_clip() into composable sub-functions, extract _generate_single_segment() shared method, add node instance reuse at module level, and wrap Cell 5 _run() call in explicit trigger pattern.",
+  "status": "in_progress",
+  "steps": [
+    "1. At the top of Cell 3 (after imports), add dataclass imports and define: LoRAConfig dataclass with fields (on: bool, lora: str, guard: bool, strength: float) to replace the dict-based LD_LORA_STACK entries; ClipResult dataclass with fields (path: str, last_frame: Optional[torch.Tensor], duration: float, seed: int) as return type from generate_clip.",
+    "2. Replace the global LD_LORA_STACK list-of-dicts with a list of LoRAConfig instances. Update _apply_loras() to accept List[LoRAConfig] as parameter instead of reading global. Update _LORA_STACK_JSON computation to serialize from LoRAConfig instances. Keep backward compatibility by accepting the LoRAConfig list parameter with a default that mirrors current behavior.",
+    "3. Split generate_clip() into composable sub-functions within Section D: _load_clip_encode(prompt, fps) -> tuple of (cond_pos, cond_neg); _load_unet(lora_config) -> unet model; _prepare_latents(image_tensor, width, height, frames, fps, vae_v, vae_a, image_strength, anchor_image, anchor_weight) -> av_lat tensor; _pass1(unet, cond, av_lat, seed, sigmas, sampler, cfg) -> p1_av; _preview(p1_av, show_preview) -> None (displays preview); _pass2(unet, cond, p1_av, vae_v, up_mdl, vae_a, seed, sigmas, sampler, cfg) -> p2_den; _decode_video(p2_den, vae_v, use_tiled_vae, tiled_params) -> decoded frames; _decode_audio(p2_den, vae_a) -> audio; _save(decoded, audio, fps, prefix) -> path string. Each function handles its own VRAM cleanup. The main generate_clip() becomes an orchestrator calling these functions in sequence and now returns a ClipResult.",
+    "4. Extract _generate_single_segment() method in InfiniteFlowEngine that encapsulates the try/except OOM retry logic + save + last-frame-extraction used by both _run_scene_chain() and _run_temporal_extend(). Both methods should call _generate_single_segment() instead of duplicating the pattern.",
+    "5. Create module-level node instances: at the end of _load_comfy_nodes(), create a dict _NODE_INSTANCES that caches instantiated node objects (e.g. _NODE_INSTANCES['CLIPTextEncode'] = NODE_CLASS_MAPPINGS['CLIPTextEncode']()). Update all node usage in generate_clip sub-functions to use _NODE_INSTANCES[name] instead of NODE_CLASS_MAPPINGS[name]() each time.",
+    "6. In Cell 5, wrap the _run() call: replace the bare _run() at the bottom with: if __name__ == '__main__' or 'google.colab' in sys.modules: ... pattern, or better: add a comment '# Uncomment to run:' and put _run() behind a simple guard: RUN_ON_LOAD = True; if RUN_ON_LOAD: _run(). This makes it explicit."
+  ],
+  "acceptance_criteria": [
+    "python -c \"import ast; ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read())\" passes",
+    "LoRAConfig and ClipResult dataclasses are defined with proper fields",
+    "generate_clip() returns ClipResult and internally calls the sub-functions",
+    "_generate_single_segment() exists in InfiniteFlowEngine and is called by both modes",
+    "_NODE_INSTANCES dict is populated after _load_comfy_nodes() and used by sub-functions",
+    "Cell 5 has explicit RUN_ON_LOAD guard",
+    "LD_LORA_STACK still works (backward compatible) but _apply_loras accepts LoRAConfig list"
+  ],
+  "verification": [
+    "python -c \"import ast; ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); print('PASS')\"",
+    "python -c \"import ast; tree=ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); names=[n.name for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef))]; assert 'LoRAConfig' in names; assert 'ClipResult' in names; assert '_generate_single_segment' in names; assert '_load_clip_encode' in names; assert '_pass1' in names; assert '_pass2' in names; print('All structures present')\""
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

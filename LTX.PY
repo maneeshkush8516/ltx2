@@ -161,9 +161,32 @@ import cv2
 from PIL import Image
 from pathlib import Path
 from typing import Optional, List, Any, Union, Sequence, Mapping
+from dataclasses import dataclass, field
 from base64 import b64encode
 from IPython.display import display, HTML, clear_output
 from google.colab import files
+
+
+# -- Dataclasses for structured configuration and results --
+@dataclass
+class LoRAConfig:
+    """Configuration for a single LoRA slot in the stack."""
+    on: bool = False
+    lora: str = "None"
+    guard: bool = False
+    strength: float = 1.0
+
+    def to_dict(self) -> dict:
+        return {"on": self.on, "lora": self.lora, "guard": self.guard, "strength": self.strength}
+
+
+@dataclass
+class ClipResult:
+    """Result from generate_clip() -- path, last frame tensor, duration, seed."""
+    path: str = ""
+    last_frame: Optional[torch.Tensor] = None
+    duration: float = 0.0
+    seed: int = 0
 
 warnings.filterwarnings("ignore")
 sys.path.insert(0, "/content/ComfyUI")
@@ -274,6 +297,30 @@ def _load_comfy_nodes():
         nest_asyncio.apply()
         asyncio.get_event_loop().run_until_complete(_l())
     _NODES_LOADED = True
+    # Populate module-level node instances cache
+    _populate_node_instances()
+
+
+# -- Module-level node instances cache --
+_NODE_INSTANCES: dict = {}
+
+def _populate_node_instances():
+    """Cache instantiated node objects for reuse across generate_clip sub-functions."""
+    global _NODE_INSTANCES
+    _node_names = [
+        "DualCLIPLoader", "CLIPTextEncode", "ConditioningZeroOut",
+        "LTXVConditioning", "UnetLoaderGGUF", "VAELoader",
+        "LatentUpscaleModelLoader", "EmptyImage", "ResizeImageMaskNode",
+        "GetImageSize", "EmptyLTXVLatentVideo", "LTXVPreprocess",
+        "LTXVImgToVideoInplace", "LTXVEmptyLatentAudio", "LTXVConcatAVLatent",
+        "ManualSigmas", "KSamplerSelect", "RandomNoise", "CFGGuider",
+        "SamplerCustomAdvanced", "LTXVSeparateAVLatent", "LTXVCropGuides",
+        "LTXVLatentUpsampler", "LTXVSpatioTemporalTiledVAEDecode",
+        "VAEDecode", "LTXVAudioVAEDecode", "CreateVideo",
+    ]
+    for name in _node_names:
+        if name in NODE_CLASS_MAPPINGS:
+            _NODE_INSTANCES[name] = NODE_CLASS_MAPPINGS[name]()
 
 def _audio_vae(name: str):
     if "VAELoaderKJ" in NODE_CLASS_MAPPINGS:
@@ -283,36 +330,44 @@ def _audio_vae(name: str):
 
 # -- LoRA stack definition --
 LD_LORA_STACK = [
-    {"on": True, "lora": "ltx-2-19b-ic-lora-detailer.safetensors", "guard": False, "strength": 0.4},
-    {"on": False, "lora": "None", "guard": False, "strength": 1.0},
-    {"on": False, "lora": "None", "guard": False, "strength": 1.0},
-    {"on": False, "lora": "None", "guard": False, "strength": 1.0},
-    {"on": False, "lora": "None", "guard": False, "strength": 1.0},
-    {"on": False, "lora": "None", "guard": False, "strength": 1.0},
-    {"on": False, "lora": "None", "guard": False, "strength": 1.0},
-    {"on": False, "lora": "None", "guard": False, "strength": 1.0},
-    {"on": False, "lora": "None", "guard": False, "strength": 1.0},
-    {"on": False, "lora": "None", "guard": False, "strength": 1.0},
+    LoRAConfig(on=True, lora="ltx-2-19b-ic-lora-detailer.safetensors", guard=False, strength=0.4),
+    LoRAConfig(on=False, lora="None", guard=False, strength=1.0),
+    LoRAConfig(on=False, lora="None", guard=False, strength=1.0),
+    LoRAConfig(on=False, lora="None", guard=False, strength=1.0),
+    LoRAConfig(on=False, lora="None", guard=False, strength=1.0),
+    LoRAConfig(on=False, lora="None", guard=False, strength=1.0),
+    LoRAConfig(on=False, lora="None", guard=False, strength=1.0),
+    LoRAConfig(on=False, lora="None", guard=False, strength=1.0),
+    LoRAConfig(on=False, lora="None", guard=False, strength=1.0),
+    LoRAConfig(on=False, lora="None", guard=False, strength=1.0),
 ]
-_LORA_STACK_JSON = json.dumps(LD_LORA_STACK)
+_LORA_STACK_JSON = json.dumps([lc.to_dict() for lc in LD_LORA_STACK])
 
-def _apply_loras(unet, clip_model):
-    """Apply LD_LORA_STACK to UNet. Tries LTX2MasterLoaderLD first; falls back."""
-    active = [s for s in LD_LORA_STACK
-              if s.get("on") and s.get("lora") not in (None, "None", "")]
+def _apply_loras(unet, clip_model, lora_config: Optional[List[LoRAConfig]] = None):
+    """Apply LoRA stack to UNet. Tries LTX2MasterLoaderLD first; falls back.
+
+    Args:
+        unet: The loaded UNet model.
+        clip_model: The CLIP model (may be None).
+        lora_config: Optional list of LoRAConfig instances. Defaults to LD_LORA_STACK.
+    """
+    stack = lora_config if lora_config is not None else LD_LORA_STACK
+    active = [s for s in stack
+              if s.on and s.lora not in (None, "None", "")]
     if not active:
         return unet, clip_model
+    stack_json = json.dumps([lc.to_dict() for lc in stack])
     if "LTX2MasterLoaderLD" in NODE_CLASS_MAPPINGS:
         try:
             node = NODE_CLASS_MAPPINGS["LTX2MasterLoaderLD"]()
             result = getattr(node, node.FUNCTION)(
-                model=unet, clip=clip_model, stack_data=_LORA_STACK_JSON)
+                model=unet, clip=clip_model, stack_data=stack_json)
             print(f"   [LoRA] {len(active)} slot(s) via LTX2MasterLoaderLD")
             return get_value_at_index(result, 0), clip_model
         except Exception as e:
-            print(f"   [LoRA] MasterLoader failed ({e}) - manual fallback")
+            print(f"   [LoRA] MasterLoader failed ({e}) -- manual fallback")
     for slot in active:
-        name, strength = slot["lora"], slot["strength"]
+        name, strength = slot.lora, slot.strength
         try:
             unet = LoraLoaderModelOnly().load_lora_model_only(unet, name, strength)[0]
             print(f"   [LoRA]  {name} @ {strength}")
@@ -762,6 +817,259 @@ class CharacterBible:
 #  11. Save as h264-mp4 at 25fps
 # ══════════════════════════════════════════════════════════════════════════
 
+def _get_node(name: str):
+    """Get a cached node instance, or instantiate from NODE_CLASS_MAPPINGS."""
+    if name in _NODE_INSTANCES:
+        return _NODE_INSTANCES[name]
+    return NODE_CLASS_MAPPINGS[name]()
+
+
+def _load_clip_encode(prompt: str, fps: int) -> tuple:
+    """Load CLIP, encode prompt, return conditioning tuple.
+    Deletes CLIP model after encoding to free VRAM for UNet."""
+    print("   [Clip] Loading CLIP...")
+    clip_ld = _get_node("DualCLIPLoader")
+    clip_raw = get_value_at_index(
+        clip_ld.load_clip(clip_name1=_M_CLIP1, clip_name2=_M_CLIP2,
+                          type="ltxv", device="default"), 0)
+
+    cte = _get_node("CLIPTextEncode")
+    cond_pos = cte.encode(text=prompt, clip=clip_raw)
+    # NOTE: neg_prompt is intentionally NOT encoded here. The GGUF distilled
+    # model runs at CFG=1.0 which requires zeroed-out negative conditioning.
+    zero_out = _get_node("ConditioningZeroOut")
+    cond_0 = zero_out.zero_out(conditioning=get_value_at_index(cond_pos, 0))
+    ltxv_cn = _get_node("LTXVConditioning")
+    cond = ltxv_cn.EXECUTE_NORMALIZED(
+        frame_rate=float(fps),
+        positive=get_value_at_index(cond_pos, 0),
+        negative=get_value_at_index(cond_0, 0))
+
+    # Delete CLIP now -- frees ~6-8 GB for UNet
+    del clip_raw, clip_ld
+    _vram_free()
+    _vram_print("CLIP deleted")
+    return cond
+
+
+def _load_unet(lora_config: Optional[List[LoRAConfig]] = None):
+    """Load UNet GGUF and apply LoRAs. Returns (unet, unet_loader)."""
+    print("   [Clip] Loading UNet (GGUF Q4_K_M)...")
+    unet_ld = _get_node("UnetLoaderGGUF")
+    unet = get_value_at_index(unet_ld.load_unet(unet_name=_M_UNET), 0)
+    _dummy_clip = None
+    unet, _ = _apply_loras(unet, _dummy_clip, lora_config=lora_config)
+    _vram_print("UNet + LoRAs loaded")
+    return unet, unet_ld
+
+
+def _prepare_latents(image_tensor, width, height, frames, fps, vae_v, vae_a,
+                     image_strength, anchor_image, anchor_weight):
+    """Prepare AV latent tensor for sampling. Handles T2V and I2V modes.
+    Returns av_lat tensor."""
+    img_bypass = image_tensor is None
+    img_str = image_strength if not img_bypass else 0.0
+
+    ei = _get_node("EmptyImage")
+    full_i = ei.generate(width=width, height=height, batch_size=1, color=0)
+    rimn = _get_node("ResizeImageMaskNode")
+    half_i = rimn.EXECUTE_NORMALIZED(
+        input=get_value_at_index(full_i, 0), scale_method="area",
+        resize_type={"resize_type": "scale by multiplier", "multiplier": 0.5})
+    gis = _get_node("GetImageSize")
+    hsz = gis.EXECUTE_NORMALIZED(image=get_value_at_index(half_i, 0))
+    hw, hh = get_value_at_index(hsz, 0), get_value_at_index(hsz, 1)
+
+    eltxv = _get_node("EmptyLTXVLatentVideo")
+    vid_lat = eltxv.EXECUTE_NORMALIZED(width=hw, height=hh, length=frames, batch_size=1)
+
+    # I2V: condition the latent on the seed/last-frame image
+    if not img_bypass:
+        conditioning_img = image_tensor
+        if anchor_image is not None:
+            conditioning_img = (
+                (1.0 - anchor_weight) * image_tensor + anchor_weight * anchor_image
+            )
+        rim2 = _get_node("ResizeImageMaskNode")
+        ri2 = rim2.EXECUTE_NORMALIZED(
+            input=conditioning_img, scale_method="lanczos",
+            resize_type={"resize_type": "scale dimensions",
+                         "width": hw * 2, "height": hh * 2, "crop": "center"})
+        ppn = _get_node("LTXVPreprocess")
+        pp = get_value_at_index(ppn.EXECUTE_NORMALIZED(
+            img_compression=33, image=get_value_at_index(ri2, 0)), 0)
+        i2v = _get_node("LTXVImgToVideoInplace")
+        vid_lat = (get_value_at_index(i2v.EXECUTE_NORMALIZED(
+            strength=img_str, bypass=False,
+            vae=vae_v, image=pp,
+            latent=get_value_at_index(vid_lat, 0)), 0),)
+    else:
+        vid_lat = (get_value_at_index(vid_lat, 0),)
+
+    # Audio latent + concat AV
+    elalat = _get_node("LTXVEmptyLatentAudio")
+    aud_lat = elalat.EXECUTE_NORMALIZED(
+        frames_number=frames, frame_rate=fps, batch_size=1, audio_vae=vae_a)
+    catav = _get_node("LTXVConcatAVLatent")
+    av_lat = get_value_at_index(catav.EXECUTE_NORMALIZED(
+        video_latent=vid_lat[0],
+        audio_latent=get_value_at_index(aud_lat, 0)), 0)
+    return av_lat
+
+
+def _pass1(unet, cond, av_lat, seed, sigmas, sampler, cfg):
+    """Run Pass 1 sampling. Returns p1_av latent."""
+    print("   [Clip] Pass 1...")
+    _vram_print()
+    ms = _get_node("ManualSigmas")
+    ks = _get_node("KSamplerSelect")
+    rn = _get_node("RandomNoise")
+    cfg_node = _get_node("CFGGuider")
+    sca = _get_node("SamplerCustomAdvanced")
+
+    g1 = cfg_node.EXECUTE_NORMALIZED(cfg=cfg, model=unet,
+                                     positive=get_value_at_index(cond, 0),
+                                     negative=get_value_at_index(cond, 1))
+    o1 = sca.EXECUTE_NORMALIZED(
+        noise=get_value_at_index(rn.EXECUTE_NORMALIZED(noise_seed=seed), 0),
+        guider=get_value_at_index(g1, 0),
+        sampler=get_value_at_index(ks.EXECUTE_NORMALIZED(sampler_name=sampler), 0),
+        sigmas=get_value_at_index(ms.EXECUTE_NORMALIZED(sigmas=sigmas), 0),
+        latent_image=av_lat)
+    p1_av = get_value_at_index(o1, 0)
+    del g1
+    _vram_free()
+    print("   [Clip] Pass 1 done")
+    return p1_av
+
+
+def _preview(p1_av, show_preview: bool) -> None:
+    """TinyVAE preview after Pass 1."""
+    if not show_preview:
+        return
+    try:
+        print("   [Clip] TinyVAE preview...")
+        sep_prev = _get_node("LTXVSeparateAVLatent")
+        s_prev = sep_prev.EXECUTE_NORMALIZED(av_latent=p1_av)
+        vl_prev = get_value_at_index(s_prev, 0)
+
+        tiny_vae_ld = _get_node("VAELoader")
+        tiny_vae = get_value_at_index(
+            tiny_vae_ld.load_vae(vae_name=_M_TAEV), 0)
+
+        vd_prev = _get_node("VAEDecode")
+        prev_frames = get_value_at_index(
+            vd_prev.decode(samples=vl_prev, vae=tiny_vae), 0)
+
+        if prev_frames is not None and prev_frames.shape[0] > 0:
+            preview_img = tensor_to_pil(prev_frames[0:1])
+            display(preview_img)
+            print("   [Clip] TinyVAE preview displayed")
+
+        del tiny_vae, tiny_vae_ld, prev_frames, vl_prev, s_prev, sep_prev, vd_prev
+        _vram_free()
+    except Exception as e:
+        print(f"   [Clip] TinyVAE preview skipped: {e}")
+
+
+def _pass2(unet, cond, p1_av, vae_v, up_mdl, seed, sigmas, sampler, cfg):
+    """Run Pass 2 -- upscale + refine. Returns p2_den latent."""
+    print("   [Clip] Pass 2 (upscale + refine)...")
+    sep = _get_node("LTXVSeparateAVLatent")
+    s1 = sep.EXECUTE_NORMALIZED(av_latent=p1_av)
+    vl1, al1 = get_value_at_index(s1, 0), get_value_at_index(s1, 1)
+
+    crop = _get_node("LTXVCropGuides")
+    cr = crop.EXECUTE_NORMALIZED(positive=get_value_at_index(cond, 0),
+                                 negative=get_value_at_index(cond, 1),
+                                 latent=vl1)
+    cfg_node = _get_node("CFGGuider")
+    g2 = cfg_node.EXECUTE_NORMALIZED(cfg=cfg, model=unet,
+                                     positive=get_value_at_index(cr, 0),
+                                     negative=get_value_at_index(cr, 1))
+
+    ltxvup = _get_node("LTXVLatentUpsampler")
+    up = ltxvup.upsample_latent(samples=get_value_at_index(cr, 2),
+                                upscale_model=up_mdl, vae=vae_v)
+    del up_mdl
+    _vram_free()
+
+    catav = _get_node("LTXVConcatAVLatent")
+    av2 = get_value_at_index(catav.EXECUTE_NORMALIZED(
+        video_latent=get_value_at_index(up, 0), audio_latent=al1), 0)
+
+    ms = _get_node("ManualSigmas")
+    ks = _get_node("KSamplerSelect")
+    rn = _get_node("RandomNoise")
+    sca = _get_node("SamplerCustomAdvanced")
+
+    o2 = sca.EXECUTE_NORMALIZED(
+        noise=get_value_at_index(rn.EXECUTE_NORMALIZED(noise_seed=seed), 0),
+        guider=get_value_at_index(g2, 0),
+        sampler=get_value_at_index(ks.EXECUTE_NORMALIZED(sampler_name=sampler), 0),
+        sigmas=get_value_at_index(ms.EXECUTE_NORMALIZED(sigmas=sigmas), 0),
+        latent_image=av2)
+    p2_den = get_value_at_index(o2, 1)
+
+    # BIG VRAM RELEASE -- UNet is done
+    del g2, unet
+    _vram_free()
+    _vram_print("UNet deleted")
+    print("   [Clip] Pass 2 done")
+    return p2_den
+
+
+def _decode_video(p2_den, vae_v, use_tiled_vae, tiled_stiles, tiled_soverlap,
+                  tiled_tlen, tiled_toverlap):
+    """Decode video latent to frames. Returns (decoded_tensor, separated_result)."""
+    sep = _get_node("LTXVSeparateAVLatent")
+    s2 = sep.EXECUTE_NORMALIZED(av_latent=p2_den)
+    vl_f = get_value_at_index(s2, 0)
+
+    decoded = None
+    if use_tiled_vae:
+        try:
+            td = _get_node("LTXVSpatioTemporalTiledVAEDecode")
+            decoded = get_value_at_index(td.EXECUTE_NORMALIZED(
+                vae=vae_v, latents=vl_f,
+                spatial_tiles=tiled_stiles, spatial_overlap=tiled_soverlap,
+                temporal_tile_length=tiled_tlen, temporal_overlap=tiled_toverlap,
+                last_frame_fix=False, working_device="auto", working_dtype="auto"), 0)
+            print("   [Clip] Tiled VAE done")
+        except (KeyError, Exception) as e:
+            print(f"   [Clip] Tiled VAE skipped ({type(e).__name__}) -- standard decode")
+            use_tiled_vae = False
+
+    if not use_tiled_vae:
+        vd = _get_node("VAEDecode")
+        decoded = get_value_at_index(vd.decode(samples=vl_f, vae=vae_v), 0)
+
+    del vae_v
+    _vram_free()
+    return decoded, s2
+
+
+def _decode_audio(s2_separated, vae_a):
+    """Decode audio latent. Returns audio output."""
+    al_f = get_value_at_index(s2_separated, 1)
+    aud_d = _get_node("LTXVAudioVAEDecode")
+    audio = aud_d.EXECUTE_NORMALIZED(samples=al_f, audio_vae=vae_a)
+    del vae_a
+    _vram_free()
+    return audio
+
+
+def _save(decoded, audio, fps, prefix) -> str:
+    """Combine video frames + audio and save to disk. Returns output path."""
+    cv_node = _get_node("CreateVideo")
+    vid_obj = cv_node.EXECUTE_NORMALIZED(
+        fps=fps, images=decoded,
+        audio=get_value_at_index(audio, 0))
+    path = save_video_obj(get_value_at_index(vid_obj, 0), prefix=prefix)
+    _vram_print("after save")
+    return path
+
+
 def generate_clip(
     image_tensor: Optional[torch.Tensor],
     prompt: str,
@@ -788,26 +1096,19 @@ def generate_clip(
     tiled_toverlap: int = 4,
     show_preview: bool = True,
     output_prefix: str = "IFE",
-) -> str:
+    lora_config: Optional[List[LoRAConfig]] = None,
+) -> ClipResult:
     """
     Two-pass LTX-2 19B GGUF generation for one clip.
     T4-safe: CLIP is deleted before UNet loads; UNet is deleted before decode.
-    Supports I2V via LTXVImgToVideoInplace and TinyVAE preview after Pass 1.
-    Supports up to 768x768 resolution and 480 frames.
+    Returns a ClipResult with path, last_frame, duration, and seed.
 
-    anchor_image: Optional tensor of the original seed image. When provided
-        alongside image_tensor (prev_samples), the two are blended in pixel
-        space using anchor_weight before I2V conditioning. This prevents
-        temporal drift in long extension sequences by maintaining a
-        gravitational pull toward the original appearance.
-    anchor_weight: Blend factor for anchor_image (0.0 = pure prev_samples,
-        1.0 = pure anchor). Default 0.25 provides subtle consistency.
+    anchor_image: Optional tensor for blending with image_tensor to prevent drift.
+    anchor_weight: Blend factor (0.0 = pure prev_samples, 1.0 = pure anchor).
     """
     _load_comfy_nodes()
 
     img_bypass = image_tensor is None
-    img_str = image_strength if not img_bypass else 0.0
-
     print(f"   [Clip] {'I2V' if not img_bypass else 'T2V'}  "
           f"{width}x{height}  {frames}f  seed={seed}")
     _vram_print("before clip load")
@@ -815,228 +1116,52 @@ def generate_clip(
     with torch.inference_mode():
 
         # -- STEP 1: CLIP -> encode -> delete --
-        print("   [Clip] Loading CLIP...")
-        clip_ld = NODE_CLASS_MAPPINGS["DualCLIPLoader"]()
-        clip_raw = get_value_at_index(
-            clip_ld.load_clip(clip_name1=_M_CLIP1, clip_name2=_M_CLIP2,
-                              type="ltxv", device="default"), 0)
-
-        cte = NODE_CLASS_MAPPINGS["CLIPTextEncode"]()
-        cond_pos = cte.encode(text=prompt, clip=clip_raw)
-        # NOTE: neg_prompt is intentionally NOT encoded here. The GGUF distilled
-        # model runs at CFG=1.0 which requires zeroed-out negative conditioning
-        # (not text-encoded negatives). The neg_prompt parameter and _build_neg()
-        # are retained for future use if CFG>1 models are supported, and for
-        # documentation of what the negative would contain.
-        zero_out = NODE_CLASS_MAPPINGS["ConditioningZeroOut"]()
-        cond_0 = zero_out.zero_out(conditioning=get_value_at_index(cond_pos, 0))
-        ltxv_cn = NODE_CLASS_MAPPINGS["LTXVConditioning"]()
-        cond = ltxv_cn.EXECUTE_NORMALIZED(
-            frame_rate=float(fps),
-            positive=get_value_at_index(cond_pos, 0),
-            negative=get_value_at_index(cond_0, 0))
-
-        # Delete CLIP now - frees ~6-8 GB for UNet
-        del clip_raw, clip_ld
-        _vram_free()
-        _vram_print("CLIP deleted")
+        cond = _load_clip_encode(prompt, fps)
 
         # -- STEP 2: UNet + LoRAs --
-        print("   [Clip] Loading UNet (GGUF Q4_K_M)...")
-        unet_ld = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]()
-        unet = get_value_at_index(unet_ld.load_unet(unet_name=_M_UNET), 0)
-        _dummy_clip = None
-        unet, _ = _apply_loras(unet, _dummy_clip)
-        _vram_print("UNet + LoRAs loaded")
+        unet, unet_ld = _load_unet(lora_config=lora_config)
 
         # -- STEP 3: VAEs + upscaler --
-        vae_ld = NODE_CLASS_MAPPINGS["VAELoader"]()
+        vae_ld = _get_node("VAELoader")
         vae_v = get_value_at_index(vae_ld.load_vae(vae_name=_M_VAE), 0)
         vae_a = get_value_at_index(_audio_vae(_M_AVAE), 0)
-        uml = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
+        uml = _get_node("LatentUpscaleModelLoader")
         up_mdl = get_value_at_index(uml.EXECUTE_NORMALIZED(model_name=_M_UP), 0)
 
         # -- STEP 4: Latent preparation --
-        ei = NODE_CLASS_MAPPINGS["EmptyImage"]()
-        full_i = ei.generate(width=width, height=height, batch_size=1, color=0)
-        rimn = NODE_CLASS_MAPPINGS["ResizeImageMaskNode"]()
-        half_i = rimn.EXECUTE_NORMALIZED(
-            input=get_value_at_index(full_i, 0), scale_method="area",
-            resize_type={"resize_type": "scale by multiplier", "multiplier": 0.5})
-        gis = NODE_CLASS_MAPPINGS["GetImageSize"]()
-        hsz = gis.EXECUTE_NORMALIZED(image=get_value_at_index(half_i, 0))
-        hw, hh = get_value_at_index(hsz, 0), get_value_at_index(hsz, 1)
-
-        eltxv = NODE_CLASS_MAPPINGS["EmptyLTXVLatentVideo"]()
-        vid_lat = eltxv.EXECUTE_NORMALIZED(width=hw, height=hh, length=frames, batch_size=1)
-
-        # I2V: condition the latent on the seed/last-frame image via LTXVImgToVideoInplace
-        # When anchor_image is provided (temporal extension), blend it with
-        # image_tensor (prev_samples) for visual consistency across extensions.
-        if not img_bypass:
-            conditioning_img = image_tensor
-            if anchor_image is not None:
-                # Blend anchor with prev_samples in pixel space to prevent drift
-                # anchor_weight controls how much the original appearance influences
-                conditioning_img = (
-                    (1.0 - anchor_weight) * image_tensor + anchor_weight * anchor_image
-                )
-
-            rim2 = NODE_CLASS_MAPPINGS["ResizeImageMaskNode"]()
-            ri2 = rim2.EXECUTE_NORMALIZED(
-                input=conditioning_img, scale_method="lanczos",
-                resize_type={"resize_type": "scale dimensions",
-                             "width": hw * 2, "height": hh * 2, "crop": "center"})
-            ppn = NODE_CLASS_MAPPINGS["LTXVPreprocess"]()
-            pp = get_value_at_index(ppn.EXECUTE_NORMALIZED(
-                img_compression=33, image=get_value_at_index(ri2, 0)), 0)
-            i2v = NODE_CLASS_MAPPINGS["LTXVImgToVideoInplace"]()
-            vid_lat = (get_value_at_index(i2v.EXECUTE_NORMALIZED(
-                strength=img_str, bypass=False,
-                vae=vae_v, image=pp,
-                latent=get_value_at_index(vid_lat, 0)), 0),)
-        else:
-            vid_lat = (get_value_at_index(vid_lat, 0),)
-
-        # Audio latent + concat AV
-        elalat = NODE_CLASS_MAPPINGS["LTXVEmptyLatentAudio"]()
-        aud_lat = elalat.EXECUTE_NORMALIZED(
-            frames_number=frames, frame_rate=fps, batch_size=1, audio_vae=vae_a)
-        catav = NODE_CLASS_MAPPINGS["LTXVConcatAVLatent"]()
-        av_lat = get_value_at_index(catav.EXECUTE_NORMALIZED(
-            video_latent=vid_lat[0],
-            audio_latent=get_value_at_index(aud_lat, 0)), 0)
+        av_lat = _prepare_latents(image_tensor, width, height, frames, fps,
+                                  vae_v, vae_a, image_strength,
+                                  anchor_image, anchor_weight)
 
         # -- STEP 5: Pass 1 --
-        print("   [Clip] Pass 1...")
-        _vram_print()
-        ms = NODE_CLASS_MAPPINGS["ManualSigmas"]()
-        ks = NODE_CLASS_MAPPINGS["KSamplerSelect"]()
-        rn = NODE_CLASS_MAPPINGS["RandomNoise"]()
-        cfg_node = NODE_CLASS_MAPPINGS["CFGGuider"]()
-        sca = NODE_CLASS_MAPPINGS["SamplerCustomAdvanced"]()
+        p1_av = _pass1(unet, cond, av_lat, seed,
+                        pass1_sigmas, pass1_sampler, pass1_cfg)
 
-        g1 = cfg_node.EXECUTE_NORMALIZED(cfg=pass1_cfg, model=unet,
-                                         positive=get_value_at_index(cond, 0),
-                                         negative=get_value_at_index(cond, 1))
-        o1 = sca.EXECUTE_NORMALIZED(
-            noise=get_value_at_index(rn.EXECUTE_NORMALIZED(noise_seed=seed), 0),
-            guider=get_value_at_index(g1, 0),
-            sampler=get_value_at_index(ks.EXECUTE_NORMALIZED(sampler_name=pass1_sampler), 0),
-            sigmas=get_value_at_index(ms.EXECUTE_NORMALIZED(sigmas=pass1_sigmas), 0),
-            latent_image=av_lat)
-        p1_av = get_value_at_index(o1, 0)
-        del g1
-        _vram_free()
-        print("   [Clip] Pass 1 done")
-
-        # -- STEP 6: TinyVAE Preview (taeltx2_3.safetensors) --
-        if show_preview:
-            try:
-                print("   [Clip] TinyVAE preview...")
-                sep_prev = NODE_CLASS_MAPPINGS["LTXVSeparateAVLatent"]()
-                s_prev = sep_prev.EXECUTE_NORMALIZED(av_latent=p1_av)
-                vl_prev = get_value_at_index(s_prev, 0)
-
-                # Load TinyVAE for quick preview decode
-                tiny_vae_ld = NODE_CLASS_MAPPINGS["VAELoader"]()
-                tiny_vae = get_value_at_index(
-                    tiny_vae_ld.load_vae(vae_name=_M_TAEV), 0)
-
-                # Quick decode of the Pass 1 video latent
-                vd_prev = NODE_CLASS_MAPPINGS["VAEDecode"]()
-                prev_frames = get_value_at_index(
-                    vd_prev.decode(samples=vl_prev, vae=tiny_vae), 0)
-
-                # Display first frame as preview
-                if prev_frames is not None and prev_frames.shape[0] > 0:
-                    preview_img = tensor_to_pil(prev_frames[0:1])
-                    display(preview_img)
-                    print("   [Clip] TinyVAE preview displayed")
-
-                # Delete TinyVAE immediately
-                del tiny_vae, tiny_vae_ld, prev_frames, vl_prev, s_prev, sep_prev, vd_prev
-                _vram_free()
-            except Exception as e:
-                print(f"   [Clip] TinyVAE preview skipped: {e}")
+        # -- STEP 6: TinyVAE Preview --
+        _preview(p1_av, show_preview)
 
         # -- STEP 7: Pass 2 (upscale + refine) --
-        print("   [Clip] Pass 2 (upscale + refine)...")
-        sep = NODE_CLASS_MAPPINGS["LTXVSeparateAVLatent"]()
-        s1 = sep.EXECUTE_NORMALIZED(av_latent=p1_av)
-        vl1, al1 = get_value_at_index(s1, 0), get_value_at_index(s1, 1)
-
-        crop = NODE_CLASS_MAPPINGS["LTXVCropGuides"]()
-        cr = crop.EXECUTE_NORMALIZED(positive=get_value_at_index(cond, 0),
-                                     negative=get_value_at_index(cond, 1),
-                                     latent=vl1)
-        g2 = cfg_node.EXECUTE_NORMALIZED(cfg=pass2_cfg, model=unet,
-                                         positive=get_value_at_index(cr, 0),
-                                         negative=get_value_at_index(cr, 1))
-
-        ltxvup = NODE_CLASS_MAPPINGS["LTXVLatentUpsampler"]()
-        up = ltxvup.upsample_latent(samples=get_value_at_index(cr, 2),
-                                    upscale_model=up_mdl, vae=vae_v)
-        del up_mdl
+        p2_den = _pass2(unet, cond, p1_av, vae_v, up_mdl,
+                         pass2_seed, pass2_sigmas, pass2_sampler, pass2_cfg)
+        del unet_ld
         _vram_free()
-
-        av2 = get_value_at_index(catav.EXECUTE_NORMALIZED(
-            video_latent=get_value_at_index(up, 0), audio_latent=al1), 0)
-
-        o2 = sca.EXECUTE_NORMALIZED(
-            noise=get_value_at_index(rn.EXECUTE_NORMALIZED(noise_seed=pass2_seed), 0),
-            guider=get_value_at_index(g2, 0),
-            sampler=get_value_at_index(ks.EXECUTE_NORMALIZED(sampler_name=pass2_sampler), 0),
-            sigmas=get_value_at_index(ms.EXECUTE_NORMALIZED(sigmas=pass2_sigmas), 0),
-            latent_image=av2)
-        p2_den = get_value_at_index(o2, 1)
-
-        # BIG VRAM RELEASE - UNet is done
-        del g2, unet, unet_ld
-        _vram_free()
-        _vram_print("UNet deleted")
-        print("   [Clip] Pass 2 done")
 
         # -- STEP 8: Decode video --
-        s2 = sep.EXECUTE_NORMALIZED(av_latent=p2_den)
-        vl_f = get_value_at_index(s2, 0)
-        al_f = get_value_at_index(s2, 1)
-
-        decoded = None
-        if use_tiled_vae:
-            try:
-                td = NODE_CLASS_MAPPINGS["LTXVSpatioTemporalTiledVAEDecode"]()
-                decoded = get_value_at_index(td.EXECUTE_NORMALIZED(
-                    vae=vae_v, latents=vl_f,
-                    spatial_tiles=tiled_stiles, spatial_overlap=tiled_soverlap,
-                    temporal_tile_length=tiled_tlen, temporal_overlap=tiled_toverlap,
-                    last_frame_fix=False, working_device="auto", working_dtype="auto"), 0)
-                print("   [Clip] Tiled VAE done")
-            except (KeyError, Exception) as e:
-                print(f"   [Clip] Tiled VAE skipped ({type(e).__name__}) - standard decode")
-                use_tiled_vae = False
-
-        if not use_tiled_vae:
-            vd = NODE_CLASS_MAPPINGS["VAEDecode"]()
-            decoded = get_value_at_index(vd.decode(samples=vl_f, vae=vae_v), 0)
-
-        del vae_v
-        _vram_free()
+        decoded, s2 = _decode_video(p2_den, vae_v, use_tiled_vae,
+                                    tiled_stiles, tiled_soverlap,
+                                    tiled_tlen, tiled_toverlap)
 
         # -- STEP 9: Audio decode --
-        aud_d = NODE_CLASS_MAPPINGS["LTXVAudioVAEDecode"]()
-        audio = aud_d.EXECUTE_NORMALIZED(samples=al_f, audio_vae=vae_a)
-        del vae_a
-        _vram_free()
+        audio = _decode_audio(s2, vae_a)
 
         # -- STEP 10: Save --
-        cv_node = NODE_CLASS_MAPPINGS["CreateVideo"]()
-        vid_obj = cv_node.EXECUTE_NORMALIZED(
-            fps=fps, images=decoded,
-            audio=get_value_at_index(audio, 0))
-        path = save_video_obj(get_value_at_index(vid_obj, 0), prefix=output_prefix)
-        _vram_print("after save")
-        return path
+        path = _save(decoded, audio, fps, output_prefix)
+
+        # Build ClipResult
+        duration = frames / float(fps)
+        last_frame = get_last_frame_tensor(path)
+        return ClipResult(path=path, last_frame=last_frame,
+                          duration=duration, seed=seed)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1152,6 +1277,69 @@ class InfiniteFlowEngine:
 
         return prompt, neg, beat_seed
 
+    # -- Single segment generation with OOM retry + save + last-frame --
+    def _generate_single_segment(
+        self,
+        image_tensor: Optional[torch.Tensor],
+        prompt: str,
+        neg: str,
+        seed: int,
+        dest_path: str,
+        output_prefix: str,
+        anchor_image: Optional[torch.Tensor] = None,
+        anchor_weight: float = 0.25,
+        label: str = "segment",
+    ) -> tuple:
+        """Encapsulates OOM retry + save + last-frame extraction logic.
+
+        Returns (dest_path, last_frame_tensor_or_None).
+        Used by both _run_scene_chain and _run_temporal_extend to avoid
+        duplicating the try/except + copy + extract pattern.
+        """
+        try:
+            result = generate_clip(
+                image_tensor=image_tensor,
+                prompt=prompt,
+                neg_prompt=neg,
+                width=self.width,
+                height=self.height,
+                frames=self.frames,
+                fps=self.fps,
+                seed=seed,
+                image_strength=self.img_strength,
+                anchor_image=anchor_image,
+                anchor_weight=anchor_weight,
+                use_tiled_vae=self.use_tiled_vae,
+                show_preview=self.show_previews,
+                output_prefix=output_prefix,
+            )
+        except torch.cuda.OutOfMemoryError:
+            _vram_free()
+            reduced_frames = max(61, self.frames // 2)
+            print(f"   OOM on {label}. Retrying with reduced frames "
+                  f"({self.frames}->{reduced_frames}) in T2V mode...")
+            result = generate_clip(
+                image_tensor=None,
+                prompt=prompt,
+                neg_prompt=neg,
+                width=self.width,
+                height=self.height,
+                frames=reduced_frames,
+                fps=self.fps,
+                seed=seed + 1,
+                use_tiled_vae=self.use_tiled_vae,
+                show_preview=False,
+                output_prefix=f"{output_prefix}_retry",
+            )
+
+        # Copy to destination and extract last frame
+        shutil.copy2(result.path, dest_path)
+        self._clip_paths.append(dest_path)
+        last_frame = result.last_frame
+        if last_frame is None:
+            last_frame = get_last_frame_tensor(dest_path)
+        return dest_path, last_frame
+
     # -- Scene Chain mode --
     def _run_scene_chain(
         self,
@@ -1185,48 +1373,19 @@ class InfiniteFlowEngine:
             print(f"  NEG:  {neg[:100]}...\n")
 
             # Phase 2: Video generation
-            try:
-                clip_path = generate_clip(
-                    image_tensor=current_image,
-                    prompt=prompt,
-                    neg_prompt=neg,
-                    width=self.width,
-                    height=self.height,
-                    frames=self.frames,
-                    fps=self.fps,
-                    seed=beat_seed,
-                    image_strength=self.img_strength,
-                    use_tiled_vae=self.use_tiled_vae,
-                    show_preview=self.show_previews,
-                    output_prefix=f"IFE_{beat_idx:03d}",
-                )
-            except torch.cuda.OutOfMemoryError:
-                _vram_free()
-                reduced_frames = max(61, self.frames // 2)
-                print(f"   OOM on beat {beat_idx}. Retrying with reduced frames "
-                      f"({self.frames}->{reduced_frames}) in T2V mode...")
-                clip_path = generate_clip(
-                    image_tensor=None,
-                    prompt=prompt,
-                    neg_prompt=neg,
-                    width=self.width,
-                    height=self.height,
-                    frames=reduced_frames,
-                    fps=self.fps,
-                    seed=beat_seed + 1,
-                    use_tiled_vae=self.use_tiled_vae,
-                    show_preview=False,
-                    output_prefix=f"IFE_{beat_idx:03d}_retry",
-                )
-
-            # Copy to output dir
             dest = os.path.join(self.output_dir, f"scene_{beat_idx:03d}.mp4")
-            shutil.copy2(clip_path, dest)
-            self._clip_paths.append(dest)
+            _, last_frame = self._generate_single_segment(
+                image_tensor=current_image,
+                prompt=prompt,
+                neg=neg,
+                seed=beat_seed,
+                dest_path=dest,
+                output_prefix=f"IFE_{beat_idx:03d}",
+                label=f"beat {beat_idx}",
+            )
             print(f"\n[IFE] Beat {beat_idx} -> {dest}")
 
-            # Extract last frame for chaining
-            last_frame = get_last_frame_tensor(dest)
+            # Chain via last frame
             current_image = last_frame if last_frame is not None else None
             if last_frame is not None:
                 print(f"[IFE]    Last frame extracted for beat {beat_idx + 1}.")
@@ -1338,50 +1497,21 @@ class InfiniteFlowEngine:
                 clip_anchor = anchor_samples
 
             # Generate the segment
-            try:
-                clip_path = generate_clip(
-                    image_tensor=conditioning_image,
-                    prompt=prompt,
-                    neg_prompt=neg,
-                    width=self.width,
-                    height=self.height,
-                    frames=self.frames,
-                    fps=self.fps,
-                    seed=seg_seed,
-                    image_strength=self.img_strength,
-                    anchor_image=clip_anchor,
-                    anchor_weight=0.25,
-                    use_tiled_vae=self.use_tiled_vae,
-                    show_preview=self.show_previews,
-                    output_prefix=f"IFE_TE_{seg_idx + 1:03d}",
-                )
-            except torch.cuda.OutOfMemoryError:
-                _vram_free()
-                reduced_frames = max(61, self.frames // 2)
-                print(f"   OOM on segment {seg_idx + 1}. Retrying with reduced frames "
-                      f"({self.frames}->{reduced_frames}) in T2V mode...")
-                clip_path = generate_clip(
-                    image_tensor=None,
-                    prompt=prompt,
-                    neg_prompt=neg,
-                    width=self.width,
-                    height=self.height,
-                    frames=reduced_frames,
-                    fps=self.fps,
-                    seed=seg_seed + 1,
-                    use_tiled_vae=self.use_tiled_vae,
-                    show_preview=False,
-                    output_prefix=f"IFE_TE_{seg_idx + 1:03d}_retry",
-                )
-
-            # Save segment
             dest = os.path.join(self.output_dir, f"segment_{seg_idx + 1:03d}.mp4")
-            shutil.copy2(clip_path, dest)
-            self._clip_paths.append(dest)
+            _, last_frame = self._generate_single_segment(
+                image_tensor=conditioning_image,
+                prompt=prompt,
+                neg=neg,
+                seed=seg_seed,
+                dest_path=dest,
+                output_prefix=f"IFE_TE_{seg_idx + 1:03d}",
+                anchor_image=clip_anchor,
+                anchor_weight=0.25,
+                label=f"segment {seg_idx + 1}",
+            )
             print(f"\n[IFE-TE] Segment {seg_idx + 1} -> {dest}")
 
             # Extract last frame as prev_samples for next extension
-            last_frame = get_last_frame_tensor(dest)
             if last_frame is not None:
                 current_image = last_frame
                 print("[IFE-TE]    prev_samples extracted (last frame) for next extension.")
@@ -1466,9 +1596,9 @@ SHOW_PREVIEWS = True  # @param {type:"boolean"}
 SEED_IMAGE_PATH = None  # @param {type:"string"}
 
 # -- LoRA stack --
-LD_LORA_STACK[0] = {"on": True, "lora": "ltx-2-19b-ic-lora-detailer.safetensors",
-                    "guard": False, "strength": 0.4}
-_LORA_STACK_JSON = json.dumps(LD_LORA_STACK)
+LD_LORA_STACK[0] = LoRAConfig(on=True, lora="ltx-2-19b-ic-lora-detailer.safetensors",
+                              guard=False, strength=0.4)
+_LORA_STACK_JSON = json.dumps([lc.to_dict() for lc in LD_LORA_STACK])
 
 # -- Generation Mode --
 GENERATION_MODE = "scene_chain"      # @param ["scene_chain","temporal_extend"]
@@ -1584,4 +1714,6 @@ def _run():
     engine.download_all()
     return engine
 
-_run()
+RUN_ON_LOAD = True
+if RUN_ON_LOAD:
+    _run()

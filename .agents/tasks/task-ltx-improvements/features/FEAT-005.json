@@ -2,7 +2,7 @@
   "id": "FEAT-005",
   "type": "feat",
   "description": "Error Handling & Robustness improvements: Checkpointing/resume, per-clip timeout, prompt quality validation, progress tracking with ETA, and CLIP fp4/fp8 fallback.",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "1. Checkpointing/resume: Add a Checkpoint class that saves/loads checkpoint.json after each successful beat. Fields: completed_beats (list of int), clip_paths (dict mapping beat_idx to path), bible_state (serialized CharacterBible), scene_history (list), current_seed (int), config_hash (hash of relevant config for invalidation). In InfiniteFlowEngine, add checkpoint_dir param (default: output_dir). At start of run(), check for existing checkpoint and resume from last completed beat. After each successful beat in _generate_single_segment(), save checkpoint.",
     "2. Per-clip timeout: Add a clip_timeout_sec: int = 600 param (default 10 min) to generate_clip() and InfiniteFlowEngine. Wrap the generate_clip() call in _generate_single_segment() with a threading-based timeout (using concurrent.futures.ThreadPoolExecutor with timeout). On timeout, raise a ClipTimeoutError (custom exception). Handle it in the retry logic by reducing frames and retrying.",
@@ -24,5 +24,5 @@
     "python -c \"import ast; tree=ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); names=[n.name for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef))]; assert 'Checkpoint' in names; assert 'ClipTimeoutError' in names or 'ProgressTracker' in names; assert '_validate_prompt' in names; assert 'ProgressTracker' in names; print('Error handling features present')\""
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "All 5 sub-features implemented successfully. Added concurrent.futures and hashlib imports to Cell 3. Checkpoint class saves after each beat in _run_scene_chain. ProgressTracker writes progress.json. ClipTimeoutError with ThreadPoolExecutor timeout wraps generate_clip in _generate_single_segment. _validate_prompt checks word count, repetition, and expansion ratio. CLIP fp4/fp8 fallback with try/except in _load_clip_encode. All backward compatible with default params."
 }

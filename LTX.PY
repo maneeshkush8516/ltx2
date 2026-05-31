@@ -1482,9 +1482,11 @@ def generate_clip(
             LD_LORA_STACK[1] = {"on": True, "lora": camera_lora, "guard": False, "strength": 0.6}
             _camera_lora_active = True
             print(f"   [Clip] Camera LoRA: {camera_lora} @ 0.6")
-        unet, _ = _apply_loras(unet, _dummy_clip)
-        if _camera_lora_active:
-            LD_LORA_STACK[1] = {"on": False, "lora": "None", "guard": False, "strength": 1.0}
+        try:
+            unet, _ = _apply_loras(unet, _dummy_clip)
+        finally:
+            if _camera_lora_active:
+                LD_LORA_STACK[1] = {"on": False, "lora": "None", "guard": False, "strength": 1.0}
         _vram_print("UNet + LoRAs loaded")
 
         # -- STEP 3: VAEs + upscaler --
@@ -1851,7 +1853,8 @@ class InfiniteFlowEngine:
         return "\n".join(self._scene_history[-2:])
 
     def _save_checkpoint(self, completed_indices: List[int], clip_paths: List[str],
-                         current_image: Optional[torch.Tensor]):
+                         current_image: Optional[torch.Tensor],
+                         anchor_image: Optional[torch.Tensor] = None):
         """Save generation progress for resume capability."""
         checkpoint = {
             "completed_indices": completed_indices,
@@ -1866,13 +1869,20 @@ class InfiniteFlowEngine:
             img.save(frame_path)
             checkpoint["current_image_path"] = frame_path
 
+        # Save anchor frame as PNG for resume
+        if anchor_image is not None:
+            anchor_path = os.path.join(self.output_dir, "checkpoint_anchor.png")
+            img = tensor_to_pil(anchor_image)
+            img.save(anchor_path)
+            checkpoint["anchor_image_path"] = anchor_path
+
         ckpt_path = os.path.join(self.output_dir, "checkpoint.json")
         with open(ckpt_path, "w") as f:
             json.dump(checkpoint, f, indent=2)
         print(f"   [Checkpoint] Saved at index {completed_indices[-1] if completed_indices else 0}")
 
-    def _load_checkpoint(self) -> Optional[Tuple[List[int], List[str], Optional[torch.Tensor]]]:
-        """Load checkpoint if available. Returns (completed_indices, clip_paths, current_image) or None."""
+    def _load_checkpoint(self) -> Optional[Tuple[List[int], List[str], Optional[torch.Tensor], Optional[torch.Tensor]]]:
+        """Load checkpoint if available. Returns (completed_indices, clip_paths, current_image, anchor_image) or None."""
         ckpt_path = os.path.join(self.output_dir, "checkpoint.json")
         if not os.path.exists(ckpt_path):
             return None
@@ -1892,8 +1902,12 @@ class InfiniteFlowEngine:
             current_image = None
             if "current_image_path" in checkpoint:
                 current_image = load_image_tensor(checkpoint["current_image_path"])
+            # Load anchor image
+            anchor_image = None
+            if "anchor_image_path" in checkpoint:
+                anchor_image = load_image_tensor(checkpoint["anchor_image_path"])
             print(f"   [Checkpoint] Resumed from index {completed[-1] if completed else 0} ({len(paths)} clips)")
-            return completed, paths, current_image
+            return completed, paths, current_image, anchor_image
         except (json.JSONDecodeError, KeyError, OSError) as e:
             print(f"   [Checkpoint] Failed to load: {e}")
             return None
@@ -1963,7 +1977,7 @@ class InfiniteFlowEngine:
         if resume:
             ckpt = self._load_checkpoint()
             if ckpt is not None:
-                completed_indices, self._clip_paths, resumed_image = ckpt
+                completed_indices, self._clip_paths, resumed_image, _ = ckpt
                 if resumed_image is not None:
                     current_image = resumed_image
                 start_idx = len(completed_indices)
@@ -2060,6 +2074,7 @@ class InfiniteFlowEngine:
                 completed_indices=list(range(beat_idx)),
                 clip_paths=self._clip_paths,
                 current_image=current_image,
+                anchor_image=None,
             )
 
             if self.show_previews:
@@ -2104,9 +2119,11 @@ class InfiniteFlowEngine:
         if resume:
             ckpt = self._load_checkpoint()
             if ckpt is not None:
-                completed_indices, self._clip_paths, resumed_image = ckpt
+                completed_indices, self._clip_paths, resumed_image, resumed_anchor = ckpt
                 if resumed_image is not None:
                     current_image = resumed_image
+                if resumed_anchor is not None:
+                    anchor_samples = resumed_anchor
                 start_idx = len(completed_indices)
                 print(f"[IFE-TE] Resuming from segment {start_idx + 1}")
 
@@ -2226,14 +2243,24 @@ class InfiniteFlowEngine:
 
             last_frame = get_last_frame_tensor(dest)
             if last_frame is not None:
-                current_image = last_frame
+                is_valid, _ = _validate_frame_quality(last_frame)
+                if is_valid:
+                    current_image = last_frame
+                else:
+                    # Fall back to anchor to prevent quality cascade
+                    if anchor_samples is not None:
+                        current_image = anchor_samples
+                        print(f"   [Quality] Using anchor image to prevent cascade degradation")
+                    else:
+                        current_image = last_frame  # No anchor available, use anyway
             else:
-                current_image = anchor_samples
+                current_image = None
 
             self._save_checkpoint(
                 completed_indices=list(range(seg_idx + 1)),
                 clip_paths=self._clip_paths,
                 current_image=current_image,
+                anchor_image=anchor_samples,
             )
 
             if self.show_previews:
@@ -2288,9 +2315,11 @@ class InfiniteFlowEngine:
         if resume:
             ckpt = self._load_checkpoint()
             if ckpt is not None:
-                completed_indices, self._clip_paths, resumed_image = ckpt
+                completed_indices, self._clip_paths, resumed_image, resumed_anchor = ckpt
                 if resumed_image is not None:
                     current_image = resumed_image
+                if resumed_anchor is not None:
+                    anchor_samples = resumed_anchor
                 start_idx = len(completed_indices)
                 print(f"[IFE-SVI] Resuming from segment {start_idx + 1}")
 
@@ -2451,12 +2480,29 @@ class InfiniteFlowEngine:
                     anchor_samples = bootstrapped
                     print(f"[IFE-SVI]   Self-bootstrapped anchor from first clip (frame at 33%)")
 
+            # Quality-aware current_image update for next segment conditioning
+            last_frame = get_last_frame_tensor(dest)
+            if last_frame is not None:
+                is_valid, _ = _validate_frame_quality(last_frame)
+                if is_valid:
+                    current_image = last_frame
+                else:
+                    # Fall back to anchor to prevent quality cascade
+                    if anchor_samples is not None:
+                        current_image = anchor_samples
+                        print(f"   [Quality] Using anchor image to prevent cascade degradation")
+                    else:
+                        current_image = last_frame  # No anchor available, use anyway
+            else:
+                current_image = None
+
             print(f"[IFE-SVI] Segment {seg_idx + 1} -> {dest}")
 
             self._save_checkpoint(
                 completed_indices=list(range(seg_idx + 1)),
                 clip_paths=self._clip_paths,
                 current_image=current_image,
+                anchor_image=anchor_samples,
             )
 
             if self.show_previews:

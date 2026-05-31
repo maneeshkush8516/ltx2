@@ -1,0 +1,21 @@
+{
+  "project_type": "Google Colab notebook script (Python) for LTX-2 video generation using ComfyUI nodes",
+  "language": "Python",
+  "build_system": "None (script runs directly in Google Colab with !pip installs and shell commands)",
+  "test_framework": "No formal test framework. Validation is structural: script must be valid Python, classes must be instantiable, functions must be callable.",
+  "build_command": "python3 -c \"import ast; ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); print('AST valid')\"",
+  "test_command": "python3 -c \"import ast; tree = ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); classes = [n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]; funcs = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]; print(f'Classes: {classes}'); print(f'Functions: {funcs}'); assert 'VisionDescribeEngine' in classes; assert 'EasyPromptEngine' in classes; assert 'CharacterBible' in classes; assert 'InfiniteFlowEngine' in classes; assert 'generate_clip' in funcs; print('All required components present')\"",
+  "verification_instructions": "1. Parse LTX.PY as valid Python AST. 2. Confirm all 5 sections (A-E) are present with correct class/function names. 3. Confirm temporal extension chaining is in InfiniteFlowEngine. 4. Confirm TinyVAE preview is in generate_clip(). 5. Confirm GGUF Q4_K_M model is used (not DEV). 6. Confirm 768x768 resolution support. 7. Confirm 480 frame support.",
+  "snapshot_or_generated_files": null,
+  "setup_instructions": "No setup needed - this is a self-contained script for Google Colab",
+  "environment_constraints": "OPEN_INTERNET mode. No GPU available in sandbox. Validation must be AST-based since ComfyUI/torch cannot run. The script targets Google Colab T4/L4 GPUs (15-24GB VRAM).",
+  "contribution_requirements": "Single file output: LTX.PY. Must maintain Colab cell structure with @title/@markdown markers. Must use GGUF Q4_K_M model (NOT DEV fp8). Must fit 15GB VRAM for T4.",
+  "key_patterns": "1. ComfyUI NODE_CLASS_MAPPINGS pattern for calling nodes. 2. VRAM management: load->use->delete pattern (CLIP before UNet). 3. get_value_at_index() to extract outputs from node tuples. 4. Two-pass generation (ManualSigmas+euler for Pass1, gradient_estimation for Pass2). 5. LTXVImgToVideoInplace for I2V conditioning. 6. Tiled VAE decode for memory efficiency. 7. Audio+Video latent concat pattern.",
+  "relevant_files": [
+    "/projects/sandbox/ltx2/LTX.PY",
+    "/projects/sandbox/ltx2/LTX2_InfiniteFlow_12Scene.py",
+    "/projects/sandbox/ltx2/LD-I2V.json",
+    "/projects/sandbox/ltx2/SVI-Pro-Workflow.json"
+  ],
+  "directory_structure": "/projects/sandbox/ltx2/ contains: LTX.PY (target file to rewrite), LTX2_InfiniteFlow_12Scene.py (reference implementation with VisionDescribe, EasyPrompt, CharacterBible, generate_clip, InfiniteFlowEngine), LD-I2V.json (ComfyUI workflow with I2V nodes, TinyVAE preview, PromptArchitect), SVI-Pro-Workflow.json (Wan2.2 temporal extension chaining with 9 subgraphs, 81 frames per clip, anchor_samples + prev_samples + source_images pattern)"
+}

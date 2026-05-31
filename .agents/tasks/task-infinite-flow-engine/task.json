@@ -1,0 +1,7 @@
+{
+  "task_id": "task-infinite-flow-engine",
+  "task_description": "Rewrite LTX.PY as a unified Infinite Flow Engine integrating VisionDescribe, EasyPrompt, CharacterBible, two-pass generate_clip with I2V and TinyVAE preview, and InfiniteFlowEngine with temporal extension chaining. Uses GGUF Q4_K_M model for T4/L4 Colab compatibility.",
+  "status": "in_progress",
+  "feature_order": ["FEAT-001"],
+  "blocked_reason": null
+}

@@ -1,0 +1,45 @@
+{
+  "id": "FEAT-001",
+  "type": "feat",
+  "description": "Rewrite /projects/sandbox/ltx2/LTX.PY as a unified Infinite Flow Engine Colab notebook integrating features from LTX2_InfiniteFlow_12Scene.py (VisionDescribe, EasyPrompt, CharacterBible, generate_clip, InfiniteFlowEngine), LD-I2V.json (I2V with LTXVImgToVideoInplace, TinyVAE preview, 768x768 resolution, 480 frames), and SVI-Pro-Workflow.json (temporal extension chaining with anchor_samples/prev_samples pattern for generating long videos by extending clips sequentially).",
+  "status": "in_progress",
+  "steps": [
+    "Write the complete LTX.PY file as a unified script with clear cell boundaries using @title/@markdown markers. The file structure must be: Cell 1 (Environment Setup), Cell 2 (Model Downloads), Cell 3 (Core Imports & Utilities), Section A (VisionDescribeEngine), Section B (EasyPromptEngine with CharacterBible lock), Section C (CharacterBible), Section D (generate_clip with two-pass pipeline + I2V + TinyVAE preview + tiled VAE), Section E (InfiniteFlowEngine with temporal extension chaining), Cell 4 (Configuration), Cell 5 (Run).",
+    "Cell 1 - Environment Setup: Include torch install, ComfyUI clone (pinned branch ComfyUI_22_01_2026_v0.10.0), custom nodes (ComfyUI_KJNodes, ComfyUI_GGUF, ComfyUI-LTXVideo, LTX2EasyPrompt-LD, LTX2-Master-Loader, ComfyUI-VideoHelperSuite), pip requirements for transformers>=4.43.0, qwen-vl-utils, huggingface_hub, imageio, imageio-ffmpeg. Install aria2 and ffmpeg via apt.",
+    "Cell 2 - Model Downloads: Use aria2c-based _dl() function. Download: ltx-2-19b-distilled_Q4_K_M.gguf (GGUF, NOT dev), gemma_3_12B_it_fp4_mixed.safetensors, ltx-2-19b-embeddings_connector_distill_bf16.safetensors, LTX2_video_vae_bf16.safetensors, LTX2_audio_vae_bf16.safetensors, taeltx2_3.safetensors (TinyVAE for preview), ltx-2-spatial-upscaler-x2-1.0.safetensors, and all LoRAs (Detailer, Canny, Depth, Pose, camera LoRAs). Include cache-skip logic.",
+    "Cell 3 - Core Imports & Utilities: Include gc/torch/numpy/cv2/PIL/pathlib imports, VRAM management functions (_vram_free, _vram_print), tensor/image helpers (pil_to_tensor, tensor_to_pil, load_image_tensor, get_last_frame_tensor), video helpers (display_video, save_video_obj, concatenate_clips), ComfyUI async node loader (_load_comfy_nodes), get_value_at_index helper.",
+    "Section A - VisionDescribeEngine: Port from LTX2_InfiniteFlow_12Scene.py. Standalone Qwen2.5-VL wrapper with 3B-fast and 7B-nsfw model options. Load->describe->unload pattern for VRAM safety. The PROMPT instructs the model to describe the image in 100-130 words with style, ethnicity, camera info, etc.",
+    "Section B - EasyPromptEngine: Port from LTX2_InfiniteFlow_12Scene.py. Full cinematic LLM expansion with NeuralDaredevil 8B, Llama 3.2 3B, and Qwen3 14B options. Include: SYSTEM_PROMPT for cinematic writing, pacing constraints based on frame count, character_bible injection as NON-NEGOTIABLE block, scene_context from VisionDescribe, lora_triggers injection, _CLEAN_RE patterns for output cleaning, _build_neg() for dynamic negative prompts. Load->generate->unload pattern.",
+    "Section C - CharacterBible: Port from LTX2_InfiniteFlow_12Scene.py. Serializable character record with add(), extract_from_description(), to_prompt_block(), save/load JSON methods.",
+    "Section D - generate_clip(): Implement the two-pass LTX-2 19B GGUF pipeline. CRITICAL VRAM sequence: (1) Load CLIP Gemma -> encode text -> DELETE CLIP -> free VRAM, (2) Load UNet GGUF -> apply LoRAs via _apply_loras(), (3) Load VAEs + upscaler, (4) Prepare latents - I2V via LTXVImgToVideoInplace(strength=1.0) + LTXVPreprocess(img_compression=33) if image provided, else T2V, (5) Pass 1 with ManualSigmas + euler + CFG=1.0, (6) ADD TinyVAE PREVIEW: after Pass 1, load taeltx2_3.safetensors VAE, decode a quick preview of the Pass 1 latent, display it, then delete TinyVAE, (7) Pass 2 with spatial upscale + gradient_estimation + CFG=1.0, (8) Delete UNet, (9) Decode video with tiled VAE (spatial_tiles=2, spatial_overlap=8, temporal_tile_length=48, temporal_overlap=4), (10) Decode audio, (11) Save as h264-mp4 at 25fps. Support width/height up to 768x768 and frame counts up to 480.",
+    "Section E - InfiniteFlowEngine: Implement the orchestrator combining scene-by-scene generation WITH temporal extension chaining (from SVI-Pro-Workflow concept). The engine must support TWO modes: (A) 'scene_chain' mode - generates separate clips per story beat, chains via last-frame extraction (original behavior from LTX2_InfiniteFlow_12Scene.py), and (B) 'temporal_extend' mode - generates an initial clip then extends it multiple times using prev_samples/anchor_samples pattern to create one long continuous video. For temporal_extend mode: generate initial clip, extract its latent as anchor_samples, then for each extension use the previous clip's last frames as prev_samples and source_images to extend with different seeds. Include rolling scene context (last 2 prompts), VisionDescribe integration, EasyPrompt expansion with CharacterBible lock, OOM retry logic.",
+    "Cell 4 - Configuration: Include all user-configurable parameters: LLM_MODEL, VISION_MODEL, CREATIVITY, WIDTH (default 768), HEIGHT (default 512, support 768), FRAMES (default 121, support up to 480), FPS (25), BASE_SEED, IMAGE_STRENGTH (1.0), USE_TILED_VAE, USE_VISION, SHOW_PREVIEWS, SEED_IMAGE_PATH, LD_LORA_STACK, CharacterBible manual entries, STORY_BEATS list, GENERATION_MODE ('scene_chain' or 'temporal_extend'), EXTENSIONS_PER_CLIP (for temporal mode, default 3).",
+    "Cell 5 - Run: Create the InfiniteFlowEngine with all configuration, call engine.run(), save character bible, concatenate clips if scene_chain mode, display final video, offer download."
+  ],
+  "acceptance_criteria": [
+    "LTX.PY parses as valid Python (ast.parse succeeds)",
+    "Contains class VisionDescribeEngine with describe() method",
+    "Contains class EasyPromptEngine with generate() method that accepts character_bible parameter",
+    "Contains class CharacterBible with add(), extract_from_description(), to_prompt_block() methods",
+    "Contains function generate_clip() with I2V support (LTXVImgToVideoInplace), TinyVAE preview, tiled VAE decode, two-pass pipeline",
+    "Contains class InfiniteFlowEngine with run() method supporting both scene_chain and temporal_extend modes",
+    "CLIP is loaded and deleted BEFORE UNet loads (VRAM management)",
+    "Uses ltx-2-19b-distilled_Q4_K_M.gguf model (GGUF, not DEV)",
+    "Supports 768x768 resolution and 480 frame counts",
+    "TinyVAE (taeltx2_3.safetensors) preview is implemented after Pass 1",
+    "Temporal extension chaining generates multiple extension clips with different seeds maintaining coherence via prev_samples/anchor_samples concept",
+    "All @title and @markdown cell markers are present for Colab formatting"
+  ],
+  "verification": [
+    "Run: python3 -c \"import ast; ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); print('Valid Python')\"",
+    "Run: python3 -c \"import ast; tree = ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); classes = [n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]; assert 'VisionDescribeEngine' in classes; assert 'EasyPromptEngine' in classes; assert 'CharacterBible' in classes; assert 'InfiniteFlowEngine' in classes; print('All classes present')\"",
+    "Run: python3 -c \"import ast; tree = ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); funcs = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]; assert 'generate_clip' in funcs; print('generate_clip present')\"",
+    "Run: grep -c 'ltx-2-19b-distilled_Q4_K_M.gguf' /projects/sandbox/ltx2/LTX.PY to confirm GGUF model used",
+    "Run: grep -c 'taeltx2' /projects/sandbox/ltx2/LTX.PY to confirm TinyVAE reference",
+    "Run: grep -c 'temporal_extend' /projects/sandbox/ltx2/LTX.PY to confirm temporal extension mode",
+    "Run: grep -c 'LTXVImgToVideoInplace' /projects/sandbox/ltx2/LTX.PY to confirm I2V integration",
+    "Run: grep -c 'anchor_samples\\|prev_samples' /projects/sandbox/ltx2/LTX.PY to confirm temporal chaining concept"
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

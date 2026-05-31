@@ -2,7 +2,7 @@
   "id": "FEAT-003",
   "type": "feat",
   "description": "VRAM & Performance improvements: CLIP conditioning caching, VisionDescribe keep_loaded option, EasyPromptEngine keep_loaded during prompt phase, TinyVAE stays loaded, graduated OOM retry strategy.",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "1. CLIP conditioning caching: Add a module-level dict _CLIP_COND_CACHE = {} that maps prompt strings to their encoded conditioning tensors (moved to CPU). In _load_clip_encode(), before loading CLIP check if the prompt is in the cache; if so, return cached tensors (moved back to GPU) without loading CLIP at all. After encoding, store result in cache (on CPU) before returning. Add a cache_clip_cond: bool = True param to generate_clip(). Add _clear_clip_cache() helper function.",
     "2. VisionDescribe keep_loaded option: Add keep_loaded: bool = False to VisionDescribeEngine.__init__(). When True, store model/processor as instance attributes after first describe() call instead of deleting them. Add an explicit unload() method. In InfiniteFlowEngine, during the prompt generation phase (when processing multiple beats), set keep_loaded=True on the vision engine, then call vision_engine.unload() before the first generate_clip() call.",
@@ -23,5 +23,5 @@
     "python -c \"import ast; tree=ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); names=[n.name for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef))]; assert '_clear_clip_cache' in names; assert '_load_tiny_vae' in names; assert '_generate_all_prompts' in names; print('VRAM features present')\""
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "All 5 sub-features implemented: (1) _CLIP_COND_CACHE dict at module level with _clear_clip_cache() helper; cache_clip_cond param added to generate_clip and _load_clip_encode. (2) VisionDescribeEngine has keep_loaded: bool = False param and unload() method; model/processor stored as instance attrs when keep_loaded=True. (3) InfiniteFlowEngine._generate_all_prompts() method sets keep_loaded=True on prompt engine, generates all prompts in batch, then unloads LLM; batch_prompts: bool = True param added to run(). (4) _TINY_VAE module-level variable with _load_tiny_vae()/_unload_tiny_vae() helpers; _preview() now uses persistent TinyVAE; unloaded at end of full run. (5) Graduated OOM retry with 4 steps: disable_preview, reduce_temporal_tile, reduce_frames, fallback_t2v_reduced; each step logs mitigation applied."
 }

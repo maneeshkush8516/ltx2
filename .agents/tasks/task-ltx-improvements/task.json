@@ -1,0 +1,7 @@
+{
+  "task_id": "task-ltx-improvements",
+  "task_description": "Implement all improvements to LTX.PY across 6 categories: Code Architecture refactoring (dataclasses, split generate_clip, node reuse), Video Quality (multi-frame, transitions, adaptive sigmas, audio continuity, auto-resolution), VRAM & Performance (CLIP caching, keep_loaded patterns, TinyVAE persist, graduated OOM), Character Consistency (drift detection, structured parsing, multi-character, latent blending), Error Handling (checkpointing, timeout, validation, progress, fp4/fp8 fallback), and New Features (camera LoRA, prompt cache, seed explorer, Drive, dynamic frames, audio hints).",
+  "status": "in_progress",
+  "feature_order": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006"],
+  "blocked_reason": null
+}

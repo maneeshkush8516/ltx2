@@ -1,0 +1,21 @@
+{
+  "project_type": "Single-file Python Colab notebook for AI video generation using LTX-2 19B GGUF model",
+  "language": "Python",
+  "build_system": "None (single .py file, runs in Google Colab). No formal build step.",
+  "test_framework": "No formal test suite. Validation is done via AST parsing (python -c 'import ast; ast.parse(open(...).read())') since the file cannot actually run outside Colab/GPU environment.",
+  "build_command": "python -c \"import ast; ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); print('AST valid')\"",
+  "test_command": "python -c \"import ast; ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); print('AST valid')\"",
+  "verification_instructions": "1. Run AST parse to confirm valid Python syntax. 2. Check that all class/function definitions are intact. 3. Verify no Colab ! or % magic (must use _shell() or subprocess). 4. Verify Cell 1-5 and Section A-E structure preserved.",
+  "snapshot_or_generated_files": null,
+  "setup_instructions": "No setup needed - the file is validated via AST parsing only. It cannot run without GPU/Colab/ComfyUI.",
+  "environment_constraints": "OPEN_INTERNET network mode available. No GPU available for actual execution. Validation is limited to AST parsing and structural checks. The file must remain valid Python (no Colab magic). Must maintain load-use-unload VRAM pattern. Target T4 (15GB) minimum, L4 (24GB) recommended.",
+  "contribution_requirements": "Keep GGUF Q4_K_M model. Maintain Colab cell structure (Cell 1-5 + Sections A-E). All code must be valid Python. Keep load-use-unload VRAM management. Single-file format. No em dashes in comments.",
+  "key_patterns": "1. _shell() wrapper replaces ! magic. 2. _vram_free() for VRAM cleanup after model unload. 3. NODE_CLASS_MAPPINGS dict for ComfyUI node access. 4. get_value_at_index() for extracting node outputs. 5. LD_LORA_STACK global list for LoRA configuration. 6. generate_clip() is the main rendering function (~200 lines). 7. InfiniteFlowEngine has two modes: scene_chain and temporal_extend. 8. EasyPromptEngine loads/unloads LLM per call (keep_loaded option exists). 9. VisionDescribeEngine loads/unloads Qwen2.5-VL per call. 10. CharacterBible serializes character info as prompt injection block.",
+  "relevant_files": [
+    "/projects/sandbox/ltx2/LTX.PY",
+    "/projects/sandbox/ltx2/LTX2_InfiniteFlow_12Scene.py",
+    "/projects/sandbox/ltx2/LD-I2V.json",
+    "/projects/sandbox/ltx2/SVI-Pro-Workflow.json"
+  ],
+  "directory_structure": "/projects/sandbox/ltx2/ - Contains LTX.PY (main file to modify), LTX2_InfiniteFlow_12Scene.py (reference patterns), LD-I2V.json and SVI-Pro-Workflow.json (ComfyUI workflow references)"
+}

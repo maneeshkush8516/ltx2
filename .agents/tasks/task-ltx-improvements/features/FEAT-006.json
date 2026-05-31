@@ -1,0 +1,32 @@
+{
+  "id": "FEAT-006",
+  "type": "feat",
+  "description": "New Features: Camera LoRA auto-selection, prompt caching, batch seed exploration, Google Drive integration, configurable transition types (already in FEAT-002 for concat - this adds per-beat config), dynamic frame count from LLM, and audio style hints.",
+  "status": "completed",
+  "steps": [
+    "1. Camera LoRA auto-selection: Add a function _select_camera_lora(prompt: str) -> Optional[LoRAConfig] that parses the expanded prompt for camera keywords mapping: {'dolly in'/'push in'/'move forward': 'ltx-2-19b-lora-camera-control-dolly-in.safetensors', 'dolly out'/'pull back': 'ltx-2-19b-lora-camera-control-dolly-out.safetensors', 'dolly left'/'pan left'/'track left': 'ltx-2-19b-lora-camera-control-dolly-left.safetensors', 'dolly right'/'pan right'/'track right': 'ltx-2-19b-lora-camera-control-dolly-right.safetensors', 'jib up'/'crane up'/'tilt up': 'ltx-2-19b-lora-camera-control-jib-up.safetensors', 'jib down'/'crane down'/'tilt down': 'ltx-2-19b-lora-camera-control-jib-down.safetensors', 'static'/'locked off'/'tripod': 'ltx-2-19b-lora-camera-control-static.safetensors'}. Returns LoRAConfig with strength=0.8 or None. Add auto_camera_lora: bool = True param to InfiniteFlowEngine. Before generate_clip(), call _select_camera_lora() and inject into the LoRA stack for that clip.",
+    "2. Prompt caching: Add a PromptCache class that stores expanded prompts in prompts_cache.json. Fields: {beat_hash: {raw_beat, expanded_prompt, negative_prompt, seed, timestamp}}. In _process_beat(), before calling EasyPromptEngine.generate(), check cache by hashing (raw_beat + character_bible_block + creativity). If cache hit, return cached prompts. After generation, store in cache. Add prompt_cache_path param to InfiniteFlowEngine (default: output_dir/prompts_cache.json).",
+    "3. Batch seed exploration: Add a seed_explore() method to InfiniteFlowEngine that generates the first 2 seconds (50 frames) of beat 1 at 4-5 different seeds, saves thumbnails (first frame of each), and returns a dict {seed: thumbnail_path}. User picks the best seed which becomes BASE_SEED. Add SEED_EXPLORER_MODE: bool = False to Cell 4 config. When True, Cell 5 runs seed_explore() instead of full generation.",
+    "4. Google Drive integration: Add a DriveIntegration class with methods: mount() (calls google.colab.drive.mount), sync_outputs(source_dir, drive_subdir) (copies output files to Drive), auto_save_after_beat(clip_path) (copies single clip to Drive immediately). Add GOOGLE_DRIVE_SYNC: bool = False and DRIVE_OUTPUT_DIR: str = '/content/drive/MyDrive/LTX_Output' to Cell 4. If enabled, after each beat save clip to Drive, and at end sync the full concatenated video.",
+    "5. Dynamic frame count: Add a _suggest_frame_count(beat: str, base_frames: int) -> int function that analyzes beat complexity. Simple/static beats ('sits', 'looks', 'waits') get fewer frames (0.75x), complex/action beats ('runs', 'fights', 'chases', 'dances', 'multiple actions') get more frames (1.25x). Clamp between 61 and 241. Add dynamic_frames: bool = False param to InfiniteFlowEngine. When True, _process_beat() also returns suggested_frames and generate_clip is called with that count.",
+    "6. Audio style hints: Add a _derive_audio_context(prompt: str) -> str function that extracts audio-relevant keywords from the expanded prompt and creates a brief audio style description (e.g., 'rain ambience, urban night, footsteps on wet pavement'). This string is logged and could be passed to audio generation if the model supports text-conditioned audio. For now, store it in ClipResult as audio_hint field and log it during generation.",
+    "7. Configurable per-beat transitions: Add a transition_type field to each story beat (optional). STORY_BEATS can be either a list of strings (backward compat) or a list of dicts: {'beat': str, 'transition': str, 'frames': int}. Add _normalize_beats(beats) function that converts either format to the dict format. Update concat_all() to apply per-clip transition types from the beat config."
+  ],
+  "acceptance_criteria": [
+    "AST parse passes",
+    "_select_camera_lora() function exists and maps keywords to LoRA filenames",
+    "PromptCache class exists with check() and store() methods",
+    "seed_explore() method exists in InfiniteFlowEngine",
+    "DriveIntegration class exists with mount() and sync_outputs() methods",
+    "_suggest_frame_count() function exists",
+    "_derive_audio_context() function exists",
+    "_normalize_beats() function exists handling both string and dict formats",
+    "Cell 4 config has SEED_EXPLORER_MODE, GOOGLE_DRIVE_SYNC, DRIVE_OUTPUT_DIR params"
+  ],
+  "verification": [
+    "python -c \"import ast; ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); print('PASS')\"",
+    "python -c \"import ast; tree=ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); names=[n.name for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef))]; assert '_select_camera_lora' in names; assert 'PromptCache' in names; assert 'seed_explore' in names; assert 'DriveIntegration' in names; assert '_suggest_frame_count' in names; assert '_derive_audio_context' in names; assert '_normalize_beats' in names; print('New features present')\""
+  ],
+  "blocked_reason": null,
+  "findings": "All 7 sub-features implemented: _select_camera_lora, PromptCache, seed_explore, DriveIntegration, _suggest_frame_count, _derive_audio_context, _normalize_beats. Added ClipResult.audio_hint field. Added Cell 4 config params: SEED_EXPLORER_MODE, GOOGLE_DRIVE_SYNC, DRIVE_OUTPUT_DIR, DYNAMIC_FRAMES, AUTO_CAMERA_LORA. Per-beat transitions integrated into concat_all. Camera LoRA injection into LD_LORA_STACK during scene_chain. Prompt caching with hash key in _run_scene_chain."
+}

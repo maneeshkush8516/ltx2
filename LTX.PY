@@ -189,6 +189,7 @@ class ClipResult:
     last_frame: Optional[torch.Tensor] = None
     duration: float = 0.0
     seed: int = 0
+    audio_hint: str = ""
 
 
 class ClipTimeoutError(Exception):
@@ -691,6 +692,339 @@ def _detect_complexity(prompt: str) -> str:
     elif simple_count >= 2 and complex_count == 0:
         return "simple"
     return "moderate"
+
+
+# -- Camera LoRA auto-selection --
+_CAMERA_LORA_MAP = {
+    "dolly in": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+    "push in": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+    "move forward": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+    "dolly out": "ltx-2-19b-lora-camera-control-dolly-out.safetensors",
+    "pull back": "ltx-2-19b-lora-camera-control-dolly-out.safetensors",
+    "dolly left": "ltx-2-19b-lora-camera-control-dolly-left.safetensors",
+    "pan left": "ltx-2-19b-lora-camera-control-dolly-left.safetensors",
+    "track left": "ltx-2-19b-lora-camera-control-dolly-left.safetensors",
+    "dolly right": "ltx-2-19b-lora-camera-control-dolly-right.safetensors",
+    "pan right": "ltx-2-19b-lora-camera-control-dolly-right.safetensors",
+    "track right": "ltx-2-19b-lora-camera-control-dolly-right.safetensors",
+    "jib up": "ltx-2-19b-lora-camera-control-jib-up.safetensors",
+    "crane up": "ltx-2-19b-lora-camera-control-jib-up.safetensors",
+    "tilt up": "ltx-2-19b-lora-camera-control-jib-up.safetensors",
+    "jib down": "ltx-2-19b-lora-camera-control-jib-down.safetensors",
+    "crane down": "ltx-2-19b-lora-camera-control-jib-down.safetensors",
+    "tilt down": "ltx-2-19b-lora-camera-control-jib-down.safetensors",
+    "static": "ltx-2-19b-lora-camera-control-static.safetensors",
+    "locked off": "ltx-2-19b-lora-camera-control-static.safetensors",
+    "tripod": "ltx-2-19b-lora-camera-control-static.safetensors",
+}
+
+
+def _select_camera_lora(prompt: str) -> Optional[LoRAConfig]:
+    """Parse the expanded prompt for camera movement keywords and return a LoRAConfig.
+
+    Scans the prompt for known camera movement phrases. If a match is found,
+    returns a LoRAConfig with the corresponding camera control LoRA enabled
+    at strength 0.8. Returns None if no camera keyword is detected.
+
+    Args:
+        prompt: The expanded cinematic prompt text.
+
+    Returns:
+        LoRAConfig with camera LoRA enabled, or None.
+    """
+    lower = prompt.lower()
+    for keyword, lora_file in _CAMERA_LORA_MAP.items():
+        if keyword in lower:
+            return LoRAConfig(on=True, lora=lora_file, guard=False, strength=0.8)
+    return None
+
+
+# -- Prompt caching --
+class PromptCache:
+    """Caches expanded prompts to avoid redundant LLM calls.
+
+    Stores results keyed by a hash of (raw_beat + character_bible + creativity).
+    Persists to a JSON file so cached prompts survive session restarts.
+    """
+
+    def __init__(self, cache_path: str = "prompts_cache.json"):
+        self._path = cache_path
+        self._cache: dict = {}
+        self._load()
+
+    def _load(self):
+        """Load existing cache from disk."""
+        if os.path.exists(self._path):
+            try:
+                with open(self._path, "r") as f:
+                    self._cache = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                self._cache = {}
+
+    def _save(self):
+        """Persist cache to disk."""
+        try:
+            with open(self._path, "w") as f:
+                json.dump(self._cache, f, indent=2)
+        except OSError:
+            pass
+
+    def _make_key(self, raw_beat: str, bible_block: str, creativity: float) -> str:
+        """Create a hash key from the input parameters."""
+        content = f"{raw_beat}|{bible_block}|{creativity}"
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+    def check(self, key: str) -> Optional[dict]:
+        """Check if a cached entry exists for the given key.
+
+        Args:
+            key: Hash key from _make_key().
+
+        Returns:
+            Dict with 'prompt' and 'negative' fields, or None if not cached.
+        """
+        entry = self._cache.get(key)
+        if entry:
+            return {"prompt": entry.get("expanded_prompt", ""),
+                    "negative": entry.get("negative_prompt", "")}
+        return None
+
+    def store(self, key: str, prompt: str, neg: str,
+              raw_beat: str = "", seed: int = 0):
+        """Store an expanded prompt in the cache.
+
+        Args:
+            key: Hash key from _make_key().
+            prompt: The expanded prompt text.
+            neg: The negative prompt text.
+            raw_beat: Original beat text (for reference).
+            seed: Seed used during expansion.
+        """
+        self._cache[key] = {
+            "raw_beat": raw_beat,
+            "expanded_prompt": prompt,
+            "negative_prompt": neg,
+            "seed": seed,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._save()
+
+
+# -- Dynamic frame count --
+_SIMPLE_BEAT_KEYWORDS = [
+    "sits", "looks", "waits", "rests", "pauses", "gazes", "stares",
+    "stands", "holds", "watches", "listens", "leans", "sleeps",
+]
+_COMPLEX_BEAT_KEYWORDS = [
+    "runs", "fights", "chases", "dances", "sprints", "jumps", "flips",
+    "attacks", "crashes", "explodes", "multiple actions", "rapid",
+    "sequence", "montage", "transforms", "battles",
+]
+
+
+def _suggest_frame_count(beat: str, base_frames: int) -> int:
+    """Analyze beat complexity and suggest an adjusted frame count.
+
+    Simple/static beats get fewer frames (0.75x base), complex/action beats
+    get more frames (1.25x base). Result is clamped between 61 and 241.
+
+    Args:
+        beat: The raw story beat text.
+        base_frames: The default frame count from configuration.
+
+    Returns:
+        Suggested frame count (int), clamped to [61, 241].
+    """
+    lower = beat.lower()
+    complex_score = sum(1 for kw in _COMPLEX_BEAT_KEYWORDS if kw in lower)
+    simple_score = sum(1 for kw in _SIMPLE_BEAT_KEYWORDS if kw in lower)
+
+    if complex_score >= 2 or (complex_score >= 1 and simple_score == 0):
+        multiplier = 1.25
+    elif simple_score >= 2 or (simple_score >= 1 and complex_score == 0):
+        multiplier = 0.75
+    else:
+        multiplier = 1.0
+
+    suggested = int(base_frames * multiplier)
+    return max(61, min(241, suggested))
+
+
+# -- Audio style hints --
+_AUDIO_KEYWORD_MAP = {
+    "rain": "rain ambience",
+    "thunder": "thunder rumble",
+    "wind": "wind gusts",
+    "ocean": "ocean waves",
+    "water": "water sounds",
+    "city": "urban ambience",
+    "traffic": "traffic noise",
+    "crowd": "crowd murmur",
+    "forest": "forest ambience",
+    "birds": "birdsong",
+    "night": "nighttime ambience",
+    "footsteps": "footsteps",
+    "music": "background music",
+    "piano": "piano notes",
+    "guitar": "guitar melody",
+    "silence": "silence",
+    "door": "door sounds",
+    "car": "car engine",
+    "fire": "crackling fire",
+    "kitchen": "kitchen sounds",
+    "typing": "keyboard typing",
+    "phone": "phone ringing",
+    "explosion": "explosion impact",
+    "glass": "glass breaking",
+    "metal": "metallic sounds",
+}
+
+
+def _derive_audio_context(prompt: str) -> str:
+    """Extract audio-relevant keywords from the expanded prompt.
+
+    Scans the prompt for environment and action words that imply specific
+    audio characteristics. Returns a comma-separated string of audio hints
+    suitable for text-conditioned audio generation.
+
+    Args:
+        prompt: The expanded cinematic prompt text.
+
+    Returns:
+        Comma-separated audio style description string, or empty string.
+    """
+    lower = prompt.lower()
+    hints = []
+    for keyword, audio_desc in _AUDIO_KEYWORD_MAP.items():
+        if keyword in lower and audio_desc not in hints:
+            hints.append(audio_desc)
+    # Limit to 4 most relevant hints
+    return ", ".join(hints[:4])
+
+
+# -- Per-beat transition config / beat normalization --
+def _normalize_beats(beats) -> List[dict]:
+    """Convert story beats from either format to normalized dict format.
+
+    Accepts either:
+      - List[str]: plain beat strings (backward compatible)
+      - List[dict]: dicts with 'beat', optional 'transition', optional 'frames'
+
+    Returns:
+        List of dicts, each with keys: 'beat' (str), 'transition' (str or None),
+        'frames' (int or None).
+    """
+    normalized = []
+    if not beats:
+        return normalized
+
+    for item in beats:
+        if isinstance(item, str):
+            normalized.append({
+                "beat": item,
+                "transition": None,
+                "frames": None,
+            })
+        elif isinstance(item, dict):
+            normalized.append({
+                "beat": item.get("beat", ""),
+                "transition": item.get("transition", None),
+                "frames": item.get("frames", None),
+            })
+        else:
+            # Fallback: convert to string
+            normalized.append({
+                "beat": str(item),
+                "transition": None,
+                "frames": None,
+            })
+    return normalized
+
+
+# -- Google Drive integration --
+class DriveIntegration:
+    """Handles Google Drive mounting and output file synchronization.
+
+    Provides methods to mount Drive in Colab, sync output directories,
+    and auto-save individual clips after each beat completes.
+    """
+
+    def __init__(self, drive_output_dir: str = "/content/drive/MyDrive/LTX_Output"):
+        self.drive_output_dir = drive_output_dir
+        self._mounted = False
+
+    def mount(self) -> bool:
+        """Mount Google Drive in Colab environment.
+
+        Returns:
+            True if mount succeeded, False otherwise.
+        """
+        try:
+            from google.colab import drive
+            drive.mount("/content/drive")
+            self._mounted = True
+            Path(self.drive_output_dir).mkdir(parents=True, exist_ok=True)
+            print(f"   [Drive] Mounted. Output dir: {self.drive_output_dir}")
+            return True
+        except Exception as e:
+            print(f"   [Drive] Mount failed: {e}")
+            self._mounted = False
+            return False
+
+    def sync_outputs(self, source_dir: str, drive_subdir: str = "") -> List[str]:
+        """Copy all output files from source_dir to Google Drive.
+
+        Args:
+            source_dir: Local directory containing output files.
+            drive_subdir: Optional subdirectory within drive_output_dir.
+
+        Returns:
+            List of paths copied to Drive.
+        """
+        if not self._mounted:
+            print("   [Drive] Not mounted. Call mount() first.")
+            return []
+
+        dest = os.path.join(self.drive_output_dir, drive_subdir) if drive_subdir else self.drive_output_dir
+        Path(dest).mkdir(parents=True, exist_ok=True)
+
+        copied = []
+        try:
+            for fname in os.listdir(source_dir):
+                src_path = os.path.join(source_dir, fname)
+                if os.path.isfile(src_path):
+                    dst_path = os.path.join(dest, fname)
+                    shutil.copy2(src_path, dst_path)
+                    copied.append(dst_path)
+            print(f"   [Drive] Synced {len(copied)} files to {dest}")
+        except Exception as e:
+            print(f"   [Drive] Sync error: {e}")
+        return copied
+
+    def auto_save_after_beat(self, clip_path: str) -> Optional[str]:
+        """Copy a single clip to Google Drive immediately after generation.
+
+        Args:
+            clip_path: Path to the clip file to save.
+
+        Returns:
+            Path on Drive where the file was saved, or None on failure.
+        """
+        if not self._mounted:
+            return None
+        if not clip_path or not os.path.exists(clip_path):
+            return None
+
+        try:
+            Path(self.drive_output_dir).mkdir(parents=True, exist_ok=True)
+            fname = os.path.basename(clip_path)
+            dst = os.path.join(self.drive_output_dir, fname)
+            shutil.copy2(clip_path, dst)
+            print(f"   [Drive] Saved: {fname}")
+            return dst
+        except Exception as e:
+            print(f"   [Drive] Auto-save failed: {e}")
+            return None
 
 
 # -- ComfyUI async node loader --
@@ -2218,6 +2552,11 @@ class InfiniteFlowEngine:
         drift_check_interval: int = 3,
         clip_timeout_sec: int = 600,
         checkpoint_dir: Optional[str] = None,
+        auto_camera_lora: bool = True,
+        prompt_cache_path: Optional[str] = None,
+        dynamic_frames: bool = False,
+        google_drive_sync: bool = False,
+        drive_output_dir: str = "/content/drive/MyDrive/LTX_Output",
     ):
         self.bible = character_bible or CharacterBible()
         self.llm_model = llm_model
@@ -2244,6 +2583,14 @@ class InfiniteFlowEngine:
         self.drift_check_interval = drift_check_interval
         self.clip_timeout_sec = clip_timeout_sec
         self.checkpoint_dir = checkpoint_dir if checkpoint_dir else output_dir
+        self.auto_camera_lora = auto_camera_lora
+        self.dynamic_frames = dynamic_frames
+        self.google_drive_sync = google_drive_sync
+        self.drive_output_dir = drive_output_dir
+        self._prompt_cache = PromptCache(
+            prompt_cache_path if prompt_cache_path else
+            os.path.join(output_dir, "prompts_cache.json"))
+        self._drive = DriveIntegration(drive_output_dir) if google_drive_sync else None
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
         self._vision_engine = VisionDescribeEngine(vision_model, offline)
@@ -2556,17 +2903,77 @@ class InfiniteFlowEngine:
             print(f"\n[IFE] -- Beat {beat_idx}/{len(story_beats)} --")
             print(f"[IFE]   {beat[:80]}{'...' if len(beat) > 80 else ''}")
 
-            # Phase 1: Prompt generation
-            prompt, neg, beat_seed, pass1_sigmas = self._process_beat(
-                beat, current_image, beat_idx, base_seed)
+            # Phase 1: Prompt generation (with cache check)
+            cache_key = self._prompt_cache._make_key(
+                beat, self.bible.to_prompt_block(), self.creativity)
+            cached = self._prompt_cache.check(cache_key)
+            if cached and cached["prompt"]:
+                prompt = cached["prompt"]
+                neg = cached["negative"]
+                beat_seed = base_seed + (beat_idx - 1) * 1000
+                # Still compute sigmas from cached prompt
+                base_p1_sigmas = "1., 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+                complexity = _detect_complexity(prompt)
+                pass1_sigmas = _adaptive_sigmas(base_p1_sigmas, complexity)
+                print(f"   [Beat {beat_idx}] Using cached prompt.")
+            else:
+                prompt, neg, beat_seed, pass1_sigmas = self._process_beat(
+                    beat, current_image, beat_idx, base_seed)
+                # Store in cache
+                self._prompt_cache.store(cache_key, prompt, neg,
+                                         raw_beat=beat, seed=beat_seed)
+
             print(f"\n  EXPANDED ({len(prompt.split())}w): {prompt[:200]}...")
             print(f"  NEG:  {neg[:100]}...\n")
+
+            # Audio style hints
+            audio_hint = _derive_audio_context(prompt)
+            if audio_hint:
+                print(f"  AUDIO HINT: {audio_hint}")
+
+            # Camera LoRA auto-selection
+            camera_lora = None
+            if self.auto_camera_lora:
+                camera_lora = _select_camera_lora(prompt)
+                if camera_lora:
+                    print(f"  CAMERA LORA: {camera_lora.lora} @ {camera_lora.strength}")
+
+            # Dynamic frame count
+            beat_frames = self.frames
+            if self.dynamic_frames:
+                beat_frames = _suggest_frame_count(beat, self.frames)
+                if beat_frames != self.frames:
+                    print(f"  DYNAMIC FRAMES: {beat_frames} (base: {self.frames})")
+            # Per-beat frame override from normalized beats
+            if (hasattr(self, '_beat_frames') and self._beat_frames
+                    and beat_idx - 1 < len(self._beat_frames)
+                    and self._beat_frames[beat_idx - 1] is not None):
+                beat_frames = self._beat_frames[beat_idx - 1]
+                print(f"  PER-BEAT FRAMES: {beat_frames}")
 
             # Unload vision engine before video generation
             self._vision_engine.unload()
 
+            # Inject camera LoRA into stack if detected
+            orig_lora_stack = None
+            if camera_lora:
+                orig_lora_stack = list(LD_LORA_STACK)
+                # Find first inactive slot and inject camera LoRA
+                injected = False
+                for i, slot in enumerate(LD_LORA_STACK):
+                    if not slot.on:
+                        LD_LORA_STACK[i] = camera_lora
+                        injected = True
+                        break
+                if not injected:
+                    # Append to end if no empty slot
+                    LD_LORA_STACK.append(camera_lora)
+
             # Phase 2: Video generation
             dest = os.path.join(self.output_dir, f"scene_{beat_idx:03d}.mp4")
+            # Temporarily override frames for this beat
+            saved_frames = self.frames
+            self.frames = beat_frames
             _, last_frame = self._generate_single_segment(
                 image_tensor=current_image,
                 prompt=prompt,
@@ -2577,7 +2984,17 @@ class InfiniteFlowEngine:
                 label=f"beat {beat_idx}",
                 pass1_sigmas=pass1_sigmas,
             )
+            self.frames = saved_frames
+
+            # Restore LoRA stack
+            if orig_lora_stack is not None:
+                LD_LORA_STACK[:] = orig_lora_stack
+
             print(f"\n[IFE] Beat {beat_idx} -> {dest}")
+
+            # Google Drive auto-save after beat
+            if self._drive and self.google_drive_sync:
+                self._drive.auto_save_after_beat(dest)
 
             # Chain via last frame
             current_image = last_frame if last_frame is not None else None
@@ -2815,7 +3232,15 @@ class InfiniteFlowEngine:
 
         Supports checkpoint/resume: if a checkpoint.json exists in checkpoint_dir,
         resumes from the last completed beat. Progress is tracked in progress.json.
+
+        story_beats can be List[str] or List[dict] with per-beat config.
         """
+        # Normalize beats to dict format (backward compatible)
+        normalized = _normalize_beats(story_beats)
+        beat_strings = [b["beat"] for b in normalized]
+        self._beat_transitions = [b.get("transition") for b in normalized]
+        self._beat_frames = [b.get("frames") for b in normalized]
+
         # Resolve auto-resolution if width/height were set to 'auto'
         if (str(self.width).lower() == "auto" or str(self.height).lower() == "auto"):
             if seed_image_path and os.path.exists(seed_image_path):
@@ -2830,7 +3255,7 @@ class InfiniteFlowEngine:
 
         # Initialize checkpoint and progress tracker
         self._checkpoint = Checkpoint(self.checkpoint_dir)
-        self._progress = ProgressTracker(len(story_beats), self.output_dir)
+        self._progress = ProgressTracker(len(beat_strings), self.output_dir)
 
         # Check for existing checkpoint to resume from
         ckpt_data = self._checkpoint.load()
@@ -2856,7 +3281,7 @@ class InfiniteFlowEngine:
 
         print(f"\n[IFE] === INFINITE FLOW ENGINE ===")
         print(f"[IFE]  Mode     : {self.mode}")
-        print(f"[IFE]  Beats    : {len(story_beats)}")
+        print(f"[IFE]  Beats    : {len(beat_strings)}")
         print(f"[IFE]  Size     : {self.width}x{self.height}  {self.frames}f @ {self.fps}fps")
         print(f"[IFE]  LLM      : {self.llm_model}  Vision: {self.vision_model}")
         print(f"[IFE]  Bible    : {self.bible.names() or 'empty'}")
@@ -2864,15 +3289,17 @@ class InfiniteFlowEngine:
         print(f"[IFE]  Multi-frame: {self.multi_frame_count}")
         print(f"[IFE]  Batch prompts: {self.batch_prompts}")
         print(f"[IFE]  Timeout  : {self.clip_timeout_sec}s per clip")
+        print(f"[IFE]  Dynamic frames: {self.dynamic_frames}")
+        print(f"[IFE]  Auto camera LoRA: {self.auto_camera_lora}")
         if self.mode == "temporal_extend":
             print(f"[IFE]  Extensions: {self.extensions_per_clip}")
             print(f"[IFE]  Audio cont: {self.audio_continuity}")
 
         try:
             if self.mode == "temporal_extend":
-                result = self._run_temporal_extend(story_beats, seed_image_path, base_seed)
+                result = self._run_temporal_extend(beat_strings, seed_image_path, base_seed)
             else:
-                result = self._run_scene_chain(story_beats, seed_image_path, base_seed)
+                result = self._run_scene_chain(beat_strings, seed_image_path, base_seed)
             self._progress.complete()
             self._checkpoint.clear()
             return result
@@ -2884,15 +3311,53 @@ class InfiniteFlowEngine:
         """Concatenate all generated clips into one final video.
 
         Uses configured transition_type and transition_duration_sec.
+        If per-beat transitions are configured, applies them per clip.
         If audio_continuity is enabled and mode is temporal_extend,
         generates audio for the full concatenated video afterward.
         """
         out = os.path.join(self.output_dir, output_name)
-        result = concatenate_clips(
-            self._clip_paths, out,
-            transition_type=self.transition_type,
-            transition_duration_sec=self.transition_duration_sec,
-        )
+
+        # Check for per-beat transition config
+        has_per_beat = (hasattr(self, '_beat_transitions')
+                        and self._beat_transitions
+                        and any(t is not None for t in self._beat_transitions))
+
+        if has_per_beat and len(self._clip_paths) > 1:
+            # Apply per-beat transitions by concatenating clips in pairs
+            # Each clip (except the first) uses the transition from its beat config
+            temp_paths = []
+            current_concat = self._clip_paths[0]
+            for i in range(1, len(self._clip_paths)):
+                trans = self.transition_type  # default
+                if i < len(self._beat_transitions) and self._beat_transitions[i] is not None:
+                    trans = self._beat_transitions[i]
+                pair_out = os.path.join(
+                    self.output_dir, f"_concat_pair_{i:03d}.mp4")
+                concatenate_clips(
+                    [current_concat, self._clip_paths[i]], pair_out,
+                    transition_type=trans,
+                    transition_duration_sec=self.transition_duration_sec,
+                )
+                temp_paths.append(pair_out)
+                current_concat = pair_out
+            # Final result is the last pair concatenation
+            if os.path.exists(current_concat):
+                shutil.copy2(current_concat, out)
+            # Clean up temp files
+            for tp in temp_paths[:-1]:
+                if os.path.exists(tp):
+                    try:
+                        os.remove(tp)
+                    except OSError:
+                        pass
+            result = out
+        else:
+            result = concatenate_clips(
+                self._clip_paths, out,
+                transition_type=self.transition_type,
+                transition_duration_sec=self.transition_duration_sec,
+            )
+
         # Generate audio for the full video if audio_continuity was used
         if self.audio_continuity and self.mode == "temporal_extend":
             result = self._generate_audio_for_full_video(result)
@@ -2962,6 +3427,98 @@ class InfiniteFlowEngine:
             print(f"[IFE-TE] Audio generation failed ({e}) -- returning silent video.")
             _vram_free()
             return video_path
+
+    def seed_explore(
+        self,
+        beat: str,
+        image_path: Optional[str] = None,
+        seeds: Optional[List[int]] = None,
+        explore_frames: int = 50,
+    ) -> dict:
+        """Generate short preview clips at multiple seeds for comparison.
+
+        Creates a 2-second (explore_frames) clip for the given beat at each seed,
+        saves a thumbnail (first frame) of each, and returns a mapping of
+        seed to thumbnail path. Useful for selecting the best seed before
+        committing to a full generation run.
+
+        Args:
+            beat: The story beat text to generate.
+            image_path: Optional seed image path for I2V conditioning.
+            seeds: List of seeds to try (default: [42, 123, 256, 789, 1024]).
+            explore_frames: Number of frames per preview (default 50, ~2sec).
+
+        Returns:
+            Dict mapping seed (int) to thumbnail file path (str).
+        """
+        if seeds is None:
+            seeds = [42, 123, 256, 789, 1024]
+
+        explore_dir = os.path.join(self.output_dir, "seed_explore")
+        Path(explore_dir).mkdir(parents=True, exist_ok=True)
+
+        # Load image if provided
+        image_tensor = None
+        if image_path and os.path.exists(image_path):
+            image_tensor = load_image_tensor(image_path)
+
+        # Expand the prompt once for all seeds
+        print(f"[SeedExplore] Expanding prompt for exploration...")
+        prompt, neg = self._prompt_engine.generate(
+            user_input=beat,
+            frame_count=explore_frames,
+            creativity=self.creativity,
+            seed=seeds[0],
+            scene_context="",
+            lora_triggers=self.lora_triggers,
+            character_bible=self.bible.to_prompt_block(),
+        )
+        _vram_free()
+
+        results = {}
+        for seed_val in seeds:
+            print(f"\n[SeedExplore] Trying seed {seed_val} ({explore_frames} frames)...")
+            try:
+                dest = os.path.join(explore_dir, f"explore_seed_{seed_val}.mp4")
+                result = generate_clip(
+                    image_tensor=image_tensor,
+                    prompt=prompt,
+                    neg_prompt=neg,
+                    width=self.width,
+                    height=self.height,
+                    frames=explore_frames,
+                    fps=self.fps,
+                    seed=seed_val,
+                    image_strength=self.img_strength,
+                    use_tiled_vae=self.use_tiled_vae,
+                    show_preview=False,
+                    output_prefix=f"explore_{seed_val}",
+                    skip_audio=True,
+                )
+                # Save thumbnail (first frame)
+                if result and hasattr(result, 'path') and result.path:
+                    cap = cv2.VideoCapture(result.path)
+                    ok, frame = cap.read()
+                    cap.release()
+                    if ok:
+                        thumb_path = os.path.join(
+                            explore_dir, f"thumb_seed_{seed_val}.png")
+                        cv2.imwrite(thumb_path, frame)
+                        results[seed_val] = thumb_path
+                        print(f"[SeedExplore]   seed {seed_val} -> {thumb_path}")
+                    else:
+                        results[seed_val] = dest
+                else:
+                    results[seed_val] = ""
+                _vram_free()
+            except Exception as e:
+                print(f"[SeedExplore]   seed {seed_val} failed: {e}")
+                results[seed_val] = ""
+                _vram_free()
+
+        print(f"\n[SeedExplore] Done. {len([v for v in results.values() if v])} "
+              f"/ {len(seeds)} seeds succeeded.")
+        return results
 
     def download_all(self):
         for p in self._clip_paths:
@@ -3035,6 +3592,13 @@ TRANSITION_TYPE = "hard_cut"         # @param ["hard_cut","crossfade","dip_to_bl
 TRANSITION_DURATION_SEC = 0.5        # @param {type:"number"}
 AUDIO_CONTINUITY = True              # @param {type:"boolean"}
 BATCH_PROMPTS = True                 # @param {type:"boolean"}
+
+# -- New features --
+SEED_EXPLORER_MODE = False           # @param {type:"boolean"}
+GOOGLE_DRIVE_SYNC = False            # @param {type:"boolean"}
+DRIVE_OUTPUT_DIR = "/content/drive/MyDrive/LTX_Output"  # @param {type:"string"}
+DYNAMIC_FRAMES = False               # @param {type:"boolean"}
+AUTO_CAMERA_LORA = True              # @param {type:"boolean"}
 
 # -- Character Bible (manual override or leave empty for auto-extraction) --
 bible = CharacterBible()
@@ -3125,7 +3689,32 @@ def _run():
         transition_duration_sec=TRANSITION_DURATION_SEC,
         audio_continuity=AUDIO_CONTINUITY,
         batch_prompts=BATCH_PROMPTS,
+        auto_camera_lora=AUTO_CAMERA_LORA,
+        dynamic_frames=DYNAMIC_FRAMES,
+        google_drive_sync=GOOGLE_DRIVE_SYNC,
+        drive_output_dir=DRIVE_OUTPUT_DIR,
     )
+
+    # Seed explorer mode: generate preview thumbnails at multiple seeds
+    if SEED_EXPLORER_MODE:
+        first_beat = STORY_BEATS[0] if STORY_BEATS else "A scenic landscape"
+        if isinstance(first_beat, dict):
+            first_beat = first_beat.get("beat", "A scenic landscape")
+        results = engine.seed_explore(
+            beat=first_beat,
+            image_path=SEED_IMAGE_PATH,
+            seeds=[BASE_SEED, BASE_SEED + 100, BASE_SEED + 200,
+                   BASE_SEED + 500, BASE_SEED + 1000],
+            explore_frames=50,
+        )
+        print("\n[SeedExplore] Results:")
+        for seed_val, thumb in results.items():
+            print(f"   Seed {seed_val}: {thumb}")
+        return engine
+
+    # Mount Google Drive if enabled
+    if GOOGLE_DRIVE_SYNC and engine._drive:
+        engine._drive.mount()
 
     clip_paths = engine.run(
         story_beats=STORY_BEATS,
@@ -3146,6 +3735,14 @@ def _run():
         print(f"\n Final video: {final}")
         if SHOW_PREVIEWS:
             display_video(final)
+
+        # Sync final video to Google Drive
+        if GOOGLE_DRIVE_SYNC and engine._drive:
+            engine._drive.auto_save_after_beat(final)
+
+    # Sync all outputs to Drive
+    if GOOGLE_DRIVE_SYNC and engine._drive:
+        engine._drive.sync_outputs(engine.output_dir)
 
     # Offer download
     engine.download_all()

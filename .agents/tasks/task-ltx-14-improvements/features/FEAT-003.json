@@ -2,7 +2,7 @@
   "id": "FEAT-003",
   "type": "feat",
   "description": "Implement improvements 6, 8, 10 (progress checkpointing/resume, crossfade concatenation, quality gate between segments)",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "1. Improvement #6 (Progress checkpointing/resume): Add _save_checkpoint(self, completed_indices, clip_paths, current_image) and _load_checkpoint(self) methods to InfiniteFlowEngine. _save_checkpoint writes JSON to {self.output_dir}/checkpoint.json with: completed_indices (list of int), clip_paths (list of str), bible_state (self.bible._chars), current_image_path (save tensor as PNG to output_dir/checkpoint_frame.png). _load_checkpoint reads the JSON and returns (completed_indices, clip_paths, current_image_tensor) or None if no checkpoint. Add `resume=True` parameter to run(). At the start of each mode method, if resume=True, call _load_checkpoint and skip already-completed indices.",
     "2. Improvement #8 (Transition crossfade): Add a concat_with_crossfade(self, output_name='full_video_crossfade.mp4', duration=0.5) method to InfiniteFlowEngine. Uses ffmpeg's xfade filter to apply crossfade transitions between clips. For N clips, builds a complex filter with xfade between each pair. Use it as the default in scene_chain mode (update the final concatenation in _run() inside CELL 5 to use concat_with_crossfade for scene_chain mode).",
@@ -25,5 +25,5 @@
     "grep -n 'resume' /projects/sandbox/ltx2/LTX.PY"
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "All three improvements implemented successfully. File grew from 2727 to 2982 lines. No issues encountered. AST validates cleanly."
 }

@@ -1,8 +1,12 @@
 {
   "task_id": "task-ram-crash-fix",
   "task_description": "Fix RAM crash on T4 by making VisionDescribe and EasyPrompt features optional and disabled by default.",
-  "status": "in_progress",
+  "status": "completed",
   "feature_order": ["FEAT-001"],
   "blocked_reason": null,
-  "verification": null
+  "verification": {
+    "build": "pass",
+    "tests": "pass",
+    "summary": "AST parse passes. All key structures present. LLM_MODEL defaults to disabled. USE_VISION defaults to False. All _vision_engine usages guarded. GPU tier detection added."
+  }
 }

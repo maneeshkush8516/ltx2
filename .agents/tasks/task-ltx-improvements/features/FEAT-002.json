@@ -2,7 +2,7 @@
   "id": "FEAT-002",
   "type": "feat",
   "description": "Video Quality & Generation improvements: Multi-frame chaining, transition overlap (crossfade/dip_to_black), adaptive sigma schedule, audio continuity for temporal_extend, and resolution auto-selection.",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "1. Multi-frame chaining: Replace the current get_last_frame_tensor() single-frame extraction with a new function get_last_frames_averaged(video_path, n_frames=3) that extracts the last 3-5 frames and averages them into a single tensor for I2V conditioning. Keep get_last_frame_tensor() for backward compat but add the new function. Update InfiniteFlowEngine._generate_single_segment() and _run_temporal_extend() to use the averaged frames by default (add a config param multi_frame_count: int = 3 to __init__).",
     "2. Transition overlap: Replace concatenate_clips() with an enhanced version that supports a transition_type parameter: 'hard_cut' (current ffmpeg -c copy behavior), 'crossfade' (ffmpeg xfade filter with configurable duration), and 'dip_to_black' (xfade=fade with black intermediate). Add transition_type and transition_duration_sec params to InfiniteFlowEngine.__init__() and concat_all(). Default remains 'hard_cut' for backward compat.",
@@ -24,5 +24,5 @@
     "python -c \"import ast; tree=ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); names=[n.name for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef))]; assert 'get_last_frames_averaged' in names; assert '_adaptive_sigmas' in names; assert '_auto_resolution' in names; print('Video quality features present')\""
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "All 5 sub-features implemented: (1) get_last_frames_averaged() added, _generate_single_segment uses it by default with multi_frame_count param. (2) concatenate_clips() enhanced with transition_type (hard_cut/crossfade/dip_to_black) and transition_duration_sec. (3) _adaptive_sigmas() and _detect_complexity() added, _process_beat returns adjusted sigmas. (4) skip_audio param added to generate_clip and _generate_single_segment, audio_continuity controls temporal_extend behavior, _generate_audio_for_full_video method added. (5) _auto_resolution() function with resolution lookup table, RESOLUTION='auto' support in Cell 4, and auto-resolve in run() method."
 }

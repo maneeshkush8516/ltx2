@@ -236,10 +236,6 @@ def download_vision_model(model_key: str = "3B-fast", target_dir: str = LLM_MODE
         return ""
 
 
-# Support offline model paths (user sets before running)
-OFFLINE_LLM_PATH = ""
-OFFLINE_VISION_PATH = ""
-
 print("\nCell 2 complete: All models ready.")
 
 
@@ -932,194 +928,203 @@ def generate_clip(
     _vram_print("before clip load")
 
     with torch.inference_mode():
+        # Model variables for OOM cleanup (None so finally block can always reference them)
+        clip_raw = unet = vae_v = vae_a = up_mdl = None
 
-        # -- STEP 1: CLIP -> encode -> delete --
-        print("   [Clip] Loading CLIP...")
-        clip_ld = NODE_CLASS_MAPPINGS["DualCLIPLoader"]()
         try:
+            # -- STEP 1: CLIP -> encode -> delete --
+            print("   [Clip] Loading CLIP...")
+            clip_ld = NODE_CLASS_MAPPINGS["DualCLIPLoader"]()
             clip_raw = get_value_at_index(
                 clip_ld.load_clip(clip_name1=_M_CLIP1, clip_name2=_M_CLIP2,
                                   type="ltxv", device="default"), 0)
-        except Exception as e:
-            print(f"   fp4 failed ({e}), trying fp8...")
-            fp8 = "gemma_3_12B_it_fp8_scaled.safetensors"
-            clip_raw = get_value_at_index(
-                clip_ld.load_clip(clip_name1=fp8, clip_name2=_M_CLIP2,
-                                  type="ltxv", device="default"), 0)
 
-        cte = NODE_CLASS_MAPPINGS["CLIPTextEncode"]()
-        cond_pos = cte.encode(text=prompt, clip=clip_raw)
-        zero_out = NODE_CLASS_MAPPINGS["ConditioningZeroOut"]()
-        cond_0 = zero_out.zero_out(conditioning=get_value_at_index(cond_pos, 0))
-        ltxv_cn = NODE_CLASS_MAPPINGS["LTXVConditioning"]()
-        cond = ltxv_cn.EXECUTE_NORMALIZED(
-            frame_rate=float(fps),
-            positive=get_value_at_index(cond_pos, 0),
-            negative=get_value_at_index(cond_0, 0))
+            cte = NODE_CLASS_MAPPINGS["CLIPTextEncode"]()
+            cond_pos = cte.encode(text=prompt, clip=clip_raw)
+            zero_out = NODE_CLASS_MAPPINGS["ConditioningZeroOut"]()
+            cond_0 = zero_out.zero_out(conditioning=get_value_at_index(cond_pos, 0))
+            ltxv_cn = NODE_CLASS_MAPPINGS["LTXVConditioning"]()
+            cond = ltxv_cn.EXECUTE_NORMALIZED(
+                frame_rate=float(fps),
+                positive=get_value_at_index(cond_pos, 0),
+                negative=get_value_at_index(cond_0, 0))
 
-        # Delete CLIP now -- frees ~6-8 GB for UNet
-        del clip_raw
-        _vram_free()
-        _vram_print("CLIP deleted")
+            # Delete CLIP now -- frees ~6-8 GB for UNet
+            del clip_raw
+            clip_raw = None
+            _vram_free()
+            _vram_print("CLIP deleted")
 
-        # -- STEP 2: UNet + LoRAs --
-        print("   [Clip] Loading UNet (GGUF Q4_K_M)...")
-        unet_ld = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]()
-        unet = get_value_at_index(unet_ld.load_unet(unet_name=_M_UNET), 0)
-        _dummy_clip = None
-        unet, _ = _apply_loras(unet, _dummy_clip)
-        _vram_print("UNet + LoRAs loaded")
+            # -- STEP 2: UNet + LoRAs --
+            print("   [Clip] Loading UNet (GGUF Q4_K_M)...")
+            unet_ld = NODE_CLASS_MAPPINGS["UnetLoaderGGUF"]()
+            unet = get_value_at_index(unet_ld.load_unet(unet_name=_M_UNET), 0)
+            # clip=None is safe here: IC/camera LoRAs are model-only (no text-encoder layers)
+            _dummy_clip = None
+            unet, _ = _apply_loras(unet, _dummy_clip)
+            _vram_print("UNet + LoRAs loaded")
 
-        # -- STEP 3: VAEs + upscaler --
-        vae_ld = NODE_CLASS_MAPPINGS["VAELoader"]()
-        vae_v = get_value_at_index(vae_ld.load_vae(vae_name=_M_VAE), 0)
-        vae_a = get_value_at_index(_audio_vae(_M_AVAE), 0)
-        uml = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
-        up_mdl = get_value_at_index(uml.EXECUTE_NORMALIZED(model_name=_M_UP), 0)
+            # -- STEP 3: VAEs + upscaler (peak window ~7.5GB, proven T4-safe) --
+            vae_ld = NODE_CLASS_MAPPINGS["VAELoader"]()
+            vae_v = get_value_at_index(vae_ld.load_vae(vae_name=_M_VAE), 0)
+            vae_a = get_value_at_index(_audio_vae(_M_AVAE), 0)
+            uml = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
+            up_mdl = get_value_at_index(uml.EXECUTE_NORMALIZED(model_name=_M_UP), 0)
 
-        # -- STEP 4: Latent preparation --
-        ei = NODE_CLASS_MAPPINGS["EmptyImage"]()
-        full_i = ei.generate(width=width, height=height, batch_size=1, color=0)
-        rimn = NODE_CLASS_MAPPINGS["ResizeImageMaskNode"]()
-        half_i = rimn.EXECUTE_NORMALIZED(
-            input=get_value_at_index(full_i, 0), scale_method="area",
-            resize_type={"resize_type": "scale by multiplier", "multiplier": 0.5})
-        gis = NODE_CLASS_MAPPINGS["GetImageSize"]()
-        hsz = gis.EXECUTE_NORMALIZED(image=get_value_at_index(half_i, 0))
-        hw, hh = get_value_at_index(hsz, 0), get_value_at_index(hsz, 1)
+            # -- STEP 4: Latent preparation --
+            ei = NODE_CLASS_MAPPINGS["EmptyImage"]()
+            full_i = ei.generate(width=width, height=height, batch_size=1, color=0)
+            rimn = NODE_CLASS_MAPPINGS["ResizeImageMaskNode"]()
+            half_i = rimn.EXECUTE_NORMALIZED(
+                input=get_value_at_index(full_i, 0), scale_method="area",
+                resize_type={"resize_type": "scale by multiplier", "multiplier": 0.5})
+            gis = NODE_CLASS_MAPPINGS["GetImageSize"]()
+            hsz = gis.EXECUTE_NORMALIZED(image=get_value_at_index(half_i, 0))
+            hw, hh = get_value_at_index(hsz, 0), get_value_at_index(hsz, 1)
 
-        eltxv = NODE_CLASS_MAPPINGS["EmptyLTXVLatentVideo"]()
-        vid_lat = eltxv.EXECUTE_NORMALIZED(width=hw, height=hh, length=frames, batch_size=1)
+            eltxv = NODE_CLASS_MAPPINGS["EmptyLTXVLatentVideo"]()
+            vid_lat = eltxv.EXECUTE_NORMALIZED(width=hw, height=hh, length=frames, batch_size=1)
 
-        # I2V: condition the latent on the seed/last-frame image
-        if not img_bypass:
-            rim2 = NODE_CLASS_MAPPINGS["ResizeImageMaskNode"]()
-            ri2 = rim2.EXECUTE_NORMALIZED(
-                input=image_tensor, scale_method="lanczos",
-                resize_type={"resize_type": "scale dimensions",
-                             "width": hw * 2, "height": hh * 2, "crop": "center"})
-            ppn = NODE_CLASS_MAPPINGS["LTXVPreprocess"]()
-            pp = get_value_at_index(ppn.EXECUTE_NORMALIZED(
-                img_compression=33, image=get_value_at_index(ri2, 0)), 0)
-            i2v = NODE_CLASS_MAPPINGS["LTXVImgToVideoInplace"]()
-            vid_lat = (get_value_at_index(i2v.EXECUTE_NORMALIZED(
-                strength=img_str, bypass=False,
-                vae=vae_v, image=pp,
-                latent=get_value_at_index(vid_lat, 0)), 0),)
-        else:
-            vid_lat = (get_value_at_index(vid_lat, 0),)
+            # I2V: condition the latent on the seed/last-frame image
+            if not img_bypass:
+                rim2 = NODE_CLASS_MAPPINGS["ResizeImageMaskNode"]()
+                ri2 = rim2.EXECUTE_NORMALIZED(
+                    input=image_tensor, scale_method="lanczos",
+                    resize_type={"resize_type": "scale dimensions",
+                                 "width": hw * 2, "height": hh * 2, "crop": "center"})
+                ppn = NODE_CLASS_MAPPINGS["LTXVPreprocess"]()
+                pp = get_value_at_index(ppn.EXECUTE_NORMALIZED(
+                    img_compression=33, image=get_value_at_index(ri2, 0)), 0)
+                i2v = NODE_CLASS_MAPPINGS["LTXVImgToVideoInplace"]()
+                vid_lat = (get_value_at_index(i2v.EXECUTE_NORMALIZED(
+                    strength=img_str, bypass=False,
+                    vae=vae_v, image=pp,
+                    latent=get_value_at_index(vid_lat, 0)), 0),)
+            else:
+                vid_lat = (get_value_at_index(vid_lat, 0),)
 
-        # Audio latent + concat AV
-        elalat = NODE_CLASS_MAPPINGS["LTXVEmptyLatentAudio"]()
-        aud_lat = elalat.EXECUTE_NORMALIZED(
-            frames_number=frames, frame_rate=fps, batch_size=1, audio_vae=vae_a)
-        catav = NODE_CLASS_MAPPINGS["LTXVConcatAVLatent"]()
-        av_lat = get_value_at_index(catav.EXECUTE_NORMALIZED(
-            video_latent=vid_lat[0],
-            audio_latent=get_value_at_index(aud_lat, 0)), 0)
+            # Audio latent + concat AV
+            elalat = NODE_CLASS_MAPPINGS["LTXVEmptyLatentAudio"]()
+            aud_lat = elalat.EXECUTE_NORMALIZED(
+                frames_number=frames, frame_rate=fps, batch_size=1, audio_vae=vae_a)
+            catav = NODE_CLASS_MAPPINGS["LTXVConcatAVLatent"]()
+            av_lat = get_value_at_index(catav.EXECUTE_NORMALIZED(
+                video_latent=vid_lat[0],
+                audio_latent=get_value_at_index(aud_lat, 0)), 0)
 
-        # -- STEP 5: Pass 1 --
-        print("   [Clip] Pass 1...")
-        _vram_print()
-        ms = NODE_CLASS_MAPPINGS["ManualSigmas"]()
-        ks = NODE_CLASS_MAPPINGS["KSamplerSelect"]()
-        rn = NODE_CLASS_MAPPINGS["RandomNoise"]()
-        cfg_node = NODE_CLASS_MAPPINGS["CFGGuider"]()
-        sca = NODE_CLASS_MAPPINGS["SamplerCustomAdvanced"]()
+            # -- STEP 5: Pass 1 --
+            print("   [Clip] Pass 1...")
+            _vram_print()
+            ms = NODE_CLASS_MAPPINGS["ManualSigmas"]()
+            ks = NODE_CLASS_MAPPINGS["KSamplerSelect"]()
+            rn = NODE_CLASS_MAPPINGS["RandomNoise"]()
+            cfg_node = NODE_CLASS_MAPPINGS["CFGGuider"]()
+            sca = NODE_CLASS_MAPPINGS["SamplerCustomAdvanced"]()
 
-        g1 = cfg_node.EXECUTE_NORMALIZED(cfg=pass1_cfg, model=unet,
-                                         positive=get_value_at_index(cond, 0),
-                                         negative=get_value_at_index(cond, 1))
-        o1 = sca.EXECUTE_NORMALIZED(
-            noise=get_value_at_index(rn.EXECUTE_NORMALIZED(noise_seed=seed), 0),
-            guider=get_value_at_index(g1, 0),
-            sampler=get_value_at_index(ks.EXECUTE_NORMALIZED(sampler_name=pass1_sampler), 0),
-            sigmas=get_value_at_index(ms.EXECUTE_NORMALIZED(sigmas=pass1_sigmas), 0),
-            latent_image=av_lat)
-        p1_av = get_value_at_index(o1, 0)
-        del g1
-        _vram_free()
-        print("   [Clip] Pass 1 done.")
+            g1 = cfg_node.EXECUTE_NORMALIZED(cfg=pass1_cfg, model=unet,
+                                             positive=get_value_at_index(cond, 0),
+                                             negative=get_value_at_index(cond, 1))
+            o1 = sca.EXECUTE_NORMALIZED(
+                noise=get_value_at_index(rn.EXECUTE_NORMALIZED(noise_seed=seed), 0),
+                guider=get_value_at_index(g1, 0),
+                sampler=get_value_at_index(ks.EXECUTE_NORMALIZED(sampler_name=pass1_sampler), 0),
+                sigmas=get_value_at_index(ms.EXECUTE_NORMALIZED(sigmas=pass1_sigmas), 0),
+                latent_image=av_lat)
+            p1_av = get_value_at_index(o1, 0)
+            del g1
+            _vram_free()
+            print("   [Clip] Pass 1 done.")
 
-        # -- STEP 6: Pass 2 --
-        print("   [Clip] Pass 2 (upscale + refine)...")
-        sep = NODE_CLASS_MAPPINGS["LTXVSeparateAVLatent"]()
-        s1 = sep.EXECUTE_NORMALIZED(av_latent=p1_av)
-        vl1, al1 = get_value_at_index(s1, 0), get_value_at_index(s1, 1)
+            # -- STEP 6: Pass 2 --
+            print("   [Clip] Pass 2 (upscale + refine)...")
+            sep = NODE_CLASS_MAPPINGS["LTXVSeparateAVLatent"]()
+            s1 = sep.EXECUTE_NORMALIZED(av_latent=p1_av)
+            vl1, al1 = get_value_at_index(s1, 0), get_value_at_index(s1, 1)
 
-        crop = NODE_CLASS_MAPPINGS["LTXVCropGuides"]()
-        cr = crop.EXECUTE_NORMALIZED(positive=get_value_at_index(cond, 0),
-                                     negative=get_value_at_index(cond, 1),
-                                     latent=vl1)
-        g2 = cfg_node.EXECUTE_NORMALIZED(cfg=pass2_cfg, model=unet,
-                                         positive=get_value_at_index(cr, 0),
-                                         negative=get_value_at_index(cr, 1))
+            crop = NODE_CLASS_MAPPINGS["LTXVCropGuides"]()
+            cr = crop.EXECUTE_NORMALIZED(positive=get_value_at_index(cond, 0),
+                                         negative=get_value_at_index(cond, 1),
+                                         latent=vl1)
+            g2 = cfg_node.EXECUTE_NORMALIZED(cfg=pass2_cfg, model=unet,
+                                             positive=get_value_at_index(cr, 0),
+                                             negative=get_value_at_index(cr, 1))
 
-        ltxvup = NODE_CLASS_MAPPINGS["LTXVLatentUpsampler"]()
-        up = ltxvup.upsample_latent(samples=get_value_at_index(cr, 2),
-                                    upscale_model=up_mdl, vae=vae_v)
-        del up_mdl
-        _vram_free()
+            ltxvup = NODE_CLASS_MAPPINGS["LTXVLatentUpsampler"]()
+            up = ltxvup.upsample_latent(samples=get_value_at_index(cr, 2),
+                                        upscale_model=up_mdl, vae=vae_v)
+            del up_mdl
+            up_mdl = None
+            _vram_free()
 
-        av2 = get_value_at_index(catav.EXECUTE_NORMALIZED(
-            video_latent=get_value_at_index(up, 0), audio_latent=al1), 0)
+            av2 = get_value_at_index(catav.EXECUTE_NORMALIZED(
+                video_latent=get_value_at_index(up, 0), audio_latent=al1), 0)
 
-        o2 = sca.EXECUTE_NORMALIZED(
-            noise=get_value_at_index(rn.EXECUTE_NORMALIZED(noise_seed=pass2_seed), 0),
-            guider=get_value_at_index(g2, 0),
-            sampler=get_value_at_index(ks.EXECUTE_NORMALIZED(sampler_name=pass2_sampler), 0),
-            sigmas=get_value_at_index(ms.EXECUTE_NORMALIZED(sigmas=pass2_sigmas), 0),
-            latent_image=av2)
-        p2_den = get_value_at_index(o2, 1)
+            o2 = sca.EXECUTE_NORMALIZED(
+                noise=get_value_at_index(rn.EXECUTE_NORMALIZED(noise_seed=pass2_seed), 0),
+                guider=get_value_at_index(g2, 0),
+                sampler=get_value_at_index(ks.EXECUTE_NORMALIZED(sampler_name=pass2_sampler), 0),
+                sigmas=get_value_at_index(ms.EXECUTE_NORMALIZED(sigmas=pass2_sigmas), 0),
+                latent_image=av2)
+            p2_den = get_value_at_index(o2, 1)
 
-        # BIG VRAM RELEASE -- UNet is done
-        del g2, unet
-        _vram_free()
-        _vram_print("UNet deleted")
-        print("   [Clip] Pass 2 done.")
+            # BIG VRAM RELEASE -- UNet is done
+            del g2, unet
+            unet = None
+            _vram_free()
+            _vram_print("UNet deleted")
+            print("   [Clip] Pass 2 done.")
 
-        # -- STEP 7: Decode video --
-        s2 = sep.EXECUTE_NORMALIZED(av_latent=p2_den)
-        vl_f = get_value_at_index(s2, 0)
-        al_f = get_value_at_index(s2, 1)
+            # -- STEP 7: Decode video --
+            s2 = sep.EXECUTE_NORMALIZED(av_latent=p2_den)
+            vl_f = get_value_at_index(s2, 0)
+            al_f = get_value_at_index(s2, 1)
 
-        decoded = None
-        if use_tiled_vae:
-            try:
-                td = NODE_CLASS_MAPPINGS["LTXVSpatioTemporalTiledVAEDecode"]()
-                decoded = get_value_at_index(td.EXECUTE_NORMALIZED(
-                    vae=vae_v, latents=vl_f,
-                    spatial_tiles=tiled_stiles, spatial_overlap=tiled_soverlap,
-                    temporal_tile_length=tiled_tlen, temporal_overlap=tiled_toverlap,
-                    last_frame_fix=False, working_device="auto",
-                    working_dtype="auto"), 0)
-                print("   [Clip] Tiled VAE decode done.")
-            except (KeyError, Exception) as e:
-                print(f"   [Clip] Tiled VAE skipped ({type(e).__name__}) -- standard decode")
-                use_tiled_vae = False
+            decoded = None
+            if use_tiled_vae:
+                try:
+                    td = NODE_CLASS_MAPPINGS["LTXVSpatioTemporalTiledVAEDecode"]()
+                    decoded = get_value_at_index(td.EXECUTE_NORMALIZED(
+                        vae=vae_v, latents=vl_f,
+                        spatial_tiles=tiled_stiles, spatial_overlap=tiled_soverlap,
+                        temporal_tile_length=tiled_tlen, temporal_overlap=tiled_toverlap,
+                        last_frame_fix=False, working_device="auto",
+                        working_dtype="auto"), 0)
+                    print("   [Clip] Tiled VAE decode done.")
+                except (KeyError, Exception) as e:
+                    print(f"   [Clip] Tiled VAE skipped ({type(e).__name__}) -- standard decode")
+                    use_tiled_vae = False
 
-        if not use_tiled_vae:
-            vd = NODE_CLASS_MAPPINGS["VAEDecode"]()
-            decoded = get_value_at_index(vd.decode(samples=vl_f, vae=vae_v), 0)
+            if not use_tiled_vae:
+                vd = NODE_CLASS_MAPPINGS["VAEDecode"]()
+                decoded = get_value_at_index(vd.decode(samples=vl_f, vae=vae_v), 0)
 
-        del vae_v
-        _vram_free()
+            del vae_v
+            vae_v = None
+            _vram_free()
 
-        # -- STEP 8: Decode audio --
-        aud_d = NODE_CLASS_MAPPINGS["LTXVAudioVAEDecode"]()
-        audio = aud_d.EXECUTE_NORMALIZED(samples=al_f, audio_vae=vae_a)
-        del vae_a
-        _vram_free()
+            # -- STEP 8: Decode audio --
+            aud_d = NODE_CLASS_MAPPINGS["LTXVAudioVAEDecode"]()
+            audio = aud_d.EXECUTE_NORMALIZED(samples=al_f, audio_vae=vae_a)
+            del vae_a
+            vae_a = None
+            _vram_free()
 
-        # -- STEP 9: Save --
-        cv_node = NODE_CLASS_MAPPINGS["CreateVideo"]()
-        vid_obj = cv_node.EXECUTE_NORMALIZED(
-            fps=fps, images=decoded,
-            audio=get_value_at_index(audio, 0))
-        path = save_video_obj(get_value_at_index(vid_obj, 0), prefix=output_prefix)
-        _vram_print("after save")
-        print(f"   [Clip] Saved -> {path}")
-        return path
+            # -- STEP 9: Save --
+            cv_node = NODE_CLASS_MAPPINGS["CreateVideo"]()
+            vid_obj = cv_node.EXECUTE_NORMALIZED(
+                fps=fps, images=decoded,
+                audio=get_value_at_index(audio, 0))
+            path = save_video_obj(get_value_at_index(vid_obj, 0), prefix=output_prefix)
+            _vram_print("after save")
+            print(f"   [Clip] Saved -> {path}")
+            return path
+
+        finally:
+            # Ensure all GPU models are freed on OOM or unexpected exit
+            for _m in (clip_raw, unet, vae_v, vae_a, up_mdl):
+                if _m is not None:
+                    del _m
+            _vram_free()
 
 
 print("Cell 6 complete: generate_clip() ready.")
@@ -1321,6 +1326,8 @@ class InfiniteFlowEngine:
                     output_prefix=f"PRO_{beat_idx:03d}",
                 )
             except torch.cuda.OutOfMemoryError:
+                # gc + empty_cache reclaims cached allocations; the try/finally in
+                # generate_clip already deleted any model tensors still in scope.
                 _vram_free()
                 print(f"   OOM on beat {beat_idx}. Retrying with reduced frames in T2V...")
                 reduced_frames = max(49, self.frames - 24)

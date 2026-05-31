@@ -154,7 +154,7 @@ print("\nAll models ready.")
 # @title { "single-column": true }
 # @markdown ## 3. Imports, Helpers, Node Loader
 
-import gc, re, json, time, shutil, warnings, asyncio
+import gc, re, json, time, shutil, warnings, asyncio, hashlib
 import numpy as np
 import torch
 import cv2
@@ -162,7 +162,9 @@ from PIL import Image
 from pathlib import Path
 from typing import Optional, List, Any, Union, Sequence, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from base64 import b64encode
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from IPython.display import display, HTML, clear_output
 from google.colab import files
 
@@ -187,6 +189,140 @@ class ClipResult:
     last_frame: Optional[torch.Tensor] = None
     duration: float = 0.0
     seed: int = 0
+
+
+class ClipTimeoutError(Exception):
+    """Raised when a single clip generation exceeds the allowed timeout."""
+    pass
+
+
+class Checkpoint:
+    """Saves and loads generation state for resume after interruption.
+
+    After each successful beat, call save() to persist progress. On restart,
+    call load() to resume from the last completed beat.
+    """
+
+    def __init__(self, checkpoint_dir: str):
+        self._dir = checkpoint_dir
+        self._path = os.path.join(checkpoint_dir, "checkpoint.json")
+
+    def save(self, completed_beats: List[int], clip_paths: dict,
+             bible_state: dict, scene_history: List[str],
+             current_seed: int, config_hash: str = ""):
+        """Persist current generation state to checkpoint.json.
+
+        Args:
+            completed_beats: List of beat indices already completed.
+            clip_paths: Dict mapping beat_idx (int) to output path (str).
+            bible_state: Serialized CharacterBible data (_chars dict).
+            scene_history: Rolling scene history list.
+            current_seed: Current random seed value.
+            config_hash: Hash of relevant config for invalidation detection.
+        """
+        Path(self._dir).mkdir(parents=True, exist_ok=True)
+        data = {
+            "completed_beats": completed_beats,
+            "clip_paths": clip_paths,
+            "bible_state": bible_state,
+            "scene_history": scene_history,
+            "current_seed": current_seed,
+            "config_hash": config_hash,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        with open(self._path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def load(self) -> Optional[dict]:
+        """Load checkpoint data if available.
+
+        Returns:
+            Dict with checkpoint fields, or None if no checkpoint exists.
+        """
+        if not os.path.exists(self._path):
+            return None
+        try:
+            with open(self._path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def exists(self) -> bool:
+        """Check if a valid checkpoint file exists."""
+        return os.path.exists(self._path)
+
+    def clear(self):
+        """Remove the checkpoint file after successful completion."""
+        if os.path.exists(self._path):
+            os.remove(self._path)
+
+
+class ProgressTracker:
+    """Tracks generation progress and writes progress.json with ETA estimates.
+
+    Instantiate at the start of a run, call update() after each beat, and
+    call complete() or error() to finalize status.
+    """
+
+    def __init__(self, total_beats: int, output_dir: str):
+        self._total = total_beats
+        self._completed = 0
+        self._current_beat = 0
+        self._start_time = time.time()
+        self._status = "running"
+        self._path = os.path.join(output_dir, "progress.json")
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        self._write()
+
+    def update(self, completed: int, current_beat: int):
+        """Update progress after a beat completes.
+
+        Args:
+            completed: Total number of beats completed so far.
+            current_beat: Index of the beat just finished (1-based).
+        """
+        self._completed = completed
+        self._current_beat = current_beat
+        self._write()
+
+    def complete(self):
+        """Mark the run as complete."""
+        self._status = "complete"
+        self._completed = self._total
+        self._write()
+
+    def error(self, detail: str = ""):
+        """Mark the run as errored."""
+        self._status = "error"
+        self._write()
+
+    def to_json(self) -> dict:
+        """Return progress state as a JSON-serializable dict."""
+        elapsed = time.time() - self._start_time
+        avg_per_beat = (elapsed / self._completed) if self._completed > 0 else 0.0
+        remaining = avg_per_beat * (self._total - self._completed)
+        est_completion = ""
+        if self._status == "running" and avg_per_beat > 0:
+            est_dt = datetime.now(timezone.utc).isoformat()
+            est_completion = est_dt
+        return {
+            "total_beats": self._total,
+            "completed_beats": self._completed,
+            "current_beat": self._current_beat,
+            "elapsed_seconds": round(elapsed, 1),
+            "avg_seconds_per_beat": round(avg_per_beat, 1),
+            "estimated_remaining_seconds": round(remaining, 1),
+            "estimated_completion_time": est_completion,
+            "status": self._status,
+        }
+
+    def _write(self):
+        """Write progress.json to disk."""
+        try:
+            with open(self._path, "w") as f:
+                json.dump(self.to_json(), f, indent=2)
+        except OSError:
+            pass
 
 warnings.filterwarnings("ignore")
 sys.path.insert(0, "/content/ComfyUI")
@@ -1427,6 +1563,50 @@ class CharacterBible:
         return f"CharacterBible({self.names()})"
 
 
+def _validate_prompt(prompt: str, raw_beat: str) -> tuple:
+    """Validate an expanded prompt for quality before use in video generation.
+
+    Checks:
+      (a) Minimum word count >= 30 words.
+      (b) No excessive repetition (no word repeated > 5 times in sequence).
+      (c) Prompt is substantially longer than raw beat (at least 2x word count).
+
+    Args:
+        prompt: The expanded prompt from EasyPromptEngine.
+        raw_beat: The original story beat string.
+
+    Returns:
+        Tuple of (is_valid: bool, reason: str). If is_valid is False, reason
+        explains why validation failed.
+    """
+    words = prompt.split()
+    word_count = len(words)
+
+    # (a) Minimum word count
+    if word_count < 30:
+        return (False, f"prompt too short ({word_count} words, minimum 30)")
+
+    # (b) Excessive sequential repetition
+    if word_count > 1:
+        repeat_count = 1
+        for i in range(1, len(words)):
+            if words[i].lower() == words[i - 1].lower():
+                repeat_count += 1
+                if repeat_count > 5:
+                    return (False, f"excessive repetition of '{words[i]}' "
+                            f"({repeat_count}+ times in sequence)")
+            else:
+                repeat_count = 1
+
+    # (c) Substantially longer than raw beat
+    beat_word_count = len(raw_beat.split())
+    if beat_word_count > 0 and word_count < beat_word_count * 2:
+        return (False, f"prompt not substantially expanded "
+                f"({word_count}w vs beat {beat_word_count}w, need 2x)")
+
+    return (True, "")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # SECTION D  --  GENERATE CLIP  (two-pass LTX-2 19B GGUF pipeline)
 # @title { "single-column": true }
@@ -1477,9 +1657,16 @@ def _load_clip_encode(prompt: str, fps: int, cache_clip_cond: bool = True) -> tu
 
     print("   [Clip] Loading CLIP...")
     clip_ld = _get_node("DualCLIPLoader")
-    clip_raw = get_value_at_index(
-        clip_ld.load_clip(clip_name1=_M_CLIP1, clip_name2=_M_CLIP2,
-                          type="ltxv", device="default"), 0)
+    try:
+        clip_raw = get_value_at_index(
+            clip_ld.load_clip(clip_name1=_M_CLIP1, clip_name2=_M_CLIP2,
+                              type="ltxv", device="default"), 0)
+    except Exception as e:
+        print(f"   [Clip] fp4 CLIP failed ({e}), trying fp8 fallback...")
+        fp8_name = "gemma_3_12B_it_fp8_scaled.safetensors"
+        clip_raw = get_value_at_index(
+            clip_ld.load_clip(clip_name1=fp8_name, clip_name2=_M_CLIP2,
+                              type="ltxv", device="default"), 0)
 
     cte = _get_node("CLIPTextEncode")
     cond_pos = cte.encode(text=prompt, clip=clip_raw)
@@ -1792,6 +1979,7 @@ def generate_clip(
     skip_audio: bool = False,
     cache_clip_cond: bool = True,
     blend_mode: str = "pixel",
+    clip_timeout_sec: int = 600,
 ) -> ClipResult:
     """
     Two-pass LTX-2 19B GGUF generation for one clip.
@@ -1808,6 +1996,8 @@ def generate_clip(
     blend_mode: Anchor blending strategy. 'pixel' (default) blends image tensors
         in pixel space. 'latent_slerp' encodes both images through VAE and
         performs spherical linear interpolation in latent space using anchor_weight.
+    clip_timeout_sec: Maximum allowed time in seconds for clip generation (default 600).
+        If exceeded, raises ClipTimeoutError.
     """
     _load_comfy_nodes()
 
@@ -2026,6 +2216,8 @@ class InfiniteFlowEngine:
         audio_continuity: bool = True,
         batch_prompts: bool = True,
         drift_check_interval: int = 3,
+        clip_timeout_sec: int = 600,
+        checkpoint_dir: Optional[str] = None,
     ):
         self.bible = character_bible or CharacterBible()
         self.llm_model = llm_model
@@ -2050,6 +2242,8 @@ class InfiniteFlowEngine:
         self.audio_continuity = audio_continuity
         self.batch_prompts = batch_prompts
         self.drift_check_interval = drift_check_interval
+        self.clip_timeout_sec = clip_timeout_sec
+        self.checkpoint_dir = checkpoint_dir if checkpoint_dir else output_dir
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
         self._vision_engine = VisionDescribeEngine(vision_model, offline)
@@ -2150,6 +2344,13 @@ class InfiniteFlowEngine:
         )
         _vram_free()
 
+        # Validate prompt quality; fall back to raw beat if validation fails
+        is_valid, reason = _validate_prompt(prompt, beat)
+        if not is_valid:
+            print(f"   [Beat {beat_idx}] Prompt validation failed: {reason}")
+            print(f"   [Beat {beat_idx}] Falling back to raw beat as prompt.")
+            prompt = beat
+
         # Store for next beat rolling context
         self._scene_history.append(prompt[:400])
         if len(self._scene_history) > 2:
@@ -2219,9 +2420,26 @@ class InfiniteFlowEngine:
             tiled_tlen=48,
         )
 
-        # Attempt 0: normal generation
+        # Attempt 0: normal generation (with timeout)
         try:
-            result = generate_clip(image_tensor=image_tensor, **base_kwargs)
+            executor = ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(generate_clip, image_tensor=image_tensor, **base_kwargs)
+            try:
+                result = future.result(timeout=self.clip_timeout_sec)
+            except FuturesTimeoutError:
+                raise ClipTimeoutError(
+                    f"Clip generation exceeded {self.clip_timeout_sec}s timeout")
+            finally:
+                executor.shutdown(wait=False)
+        except ClipTimeoutError:
+            # On timeout, reduce frames and retry once
+            _vram_free()
+            reduced_frames = max(61, int(self.frames * 0.75))
+            print(f"   [Timeout Retry] {label}: reducing frames to {reduced_frames}...")
+            retry_kwargs = dict(base_kwargs)
+            retry_kwargs["frames"] = reduced_frames
+            retry_kwargs["show_preview"] = False
+            result = generate_clip(image_tensor=image_tensor, **retry_kwargs)
         except torch.cuda.OutOfMemoryError:
             _vram_free()
             result = None
@@ -2330,6 +2548,11 @@ class InfiniteFlowEngine:
         self._vision_engine.keep_loaded = True
 
         for beat_idx, beat in enumerate(story_beats, 1):
+            # Skip beats already completed (checkpoint resume)
+            if hasattr(self, '_resume_from') and beat_idx in self._resume_from:
+                print(f"\n[IFE] -- Beat {beat_idx}/{len(story_beats)} -- SKIPPED (checkpoint)")
+                continue
+
             print(f"\n[IFE] -- Beat {beat_idx}/{len(story_beats)} --")
             print(f"[IFE]   {beat[:80]}{'...' if len(beat) > 80 else ''}")
 
@@ -2362,6 +2585,24 @@ class InfiniteFlowEngine:
                 print(f"[IFE]    Last frame extracted for beat {beat_idx + 1}.")
             else:
                 print("[IFE]    No last frame - next beat will be T2V.")
+
+            # Save checkpoint after successful beat
+            if hasattr(self, '_checkpoint'):
+                cfg_str = f"{self.width}:{self.height}:{self.frames}:{self.fps}:{self.mode}"
+                cfg_hash = hashlib.md5(cfg_str.encode()).hexdigest()[:12]
+                clip_map = {str(i): p for i, p in enumerate(self._clip_paths)}
+                self._checkpoint.save(
+                    completed_beats=list(range(1, beat_idx + 1)),
+                    clip_paths=clip_map,
+                    bible_state=self.bible._chars,
+                    scene_history=self._scene_history,
+                    current_seed=base_seed + beat_idx * 1000,
+                    config_hash=cfg_hash,
+                )
+
+            # Update progress tracker
+            if hasattr(self, '_progress'):
+                self._progress.update(completed=beat_idx, current_beat=beat_idx)
 
             # Drift check every N beats
             if (self.drift_check_interval > 0
@@ -2571,6 +2812,9 @@ class InfiniteFlowEngine:
         """
         Process story beats according to the configured mode.
         Returns list of output .mp4 paths.
+
+        Supports checkpoint/resume: if a checkpoint.json exists in checkpoint_dir,
+        resumes from the last completed beat. Progress is tracked in progress.json.
         """
         # Resolve auto-resolution if width/height were set to 'auto'
         if (str(self.width).lower() == "auto" or str(self.height).lower() == "auto"):
@@ -2584,6 +2828,32 @@ class InfiniteFlowEngine:
                 self.height = 512
                 print("[IFE] Auto-resolution: no seed image, using 768x512 default")
 
+        # Initialize checkpoint and progress tracker
+        self._checkpoint = Checkpoint(self.checkpoint_dir)
+        self._progress = ProgressTracker(len(story_beats), self.output_dir)
+
+        # Check for existing checkpoint to resume from
+        ckpt_data = self._checkpoint.load()
+        if ckpt_data:
+            # Compute config hash for invalidation check
+            cfg_str = f"{self.width}:{self.height}:{self.frames}:{self.fps}:{self.mode}"
+            cfg_hash = hashlib.md5(cfg_str.encode()).hexdigest()[:12]
+            if ckpt_data.get("config_hash", "") == cfg_hash:
+                completed = ckpt_data.get("completed_beats", [])
+                print(f"[IFE] Resuming from checkpoint: {len(completed)} beats completed.")
+                # Restore state
+                self._clip_paths = list(ckpt_data.get("clip_paths", {}).values())
+                self._scene_history = ckpt_data.get("scene_history", [])
+                if ckpt_data.get("bible_state"):
+                    self.bible._chars = ckpt_data["bible_state"]
+                self._resume_from = set(completed)
+            else:
+                print("[IFE] Checkpoint config mismatch -- starting fresh.")
+                self._checkpoint.clear()
+                self._resume_from = set()
+        else:
+            self._resume_from = set()
+
         print(f"\n[IFE] === INFINITE FLOW ENGINE ===")
         print(f"[IFE]  Mode     : {self.mode}")
         print(f"[IFE]  Beats    : {len(story_beats)}")
@@ -2593,14 +2863,22 @@ class InfiniteFlowEngine:
         print(f"[IFE]  Transition: {self.transition_type} ({self.transition_duration_sec}s)")
         print(f"[IFE]  Multi-frame: {self.multi_frame_count}")
         print(f"[IFE]  Batch prompts: {self.batch_prompts}")
+        print(f"[IFE]  Timeout  : {self.clip_timeout_sec}s per clip")
         if self.mode == "temporal_extend":
             print(f"[IFE]  Extensions: {self.extensions_per_clip}")
             print(f"[IFE]  Audio cont: {self.audio_continuity}")
 
-        if self.mode == "temporal_extend":
-            return self._run_temporal_extend(story_beats, seed_image_path, base_seed)
-        else:
-            return self._run_scene_chain(story_beats, seed_image_path, base_seed)
+        try:
+            if self.mode == "temporal_extend":
+                result = self._run_temporal_extend(story_beats, seed_image_path, base_seed)
+            else:
+                result = self._run_scene_chain(story_beats, seed_image_path, base_seed)
+            self._progress.complete()
+            self._checkpoint.clear()
+            return result
+        except Exception as e:
+            self._progress.error(str(e))
+            raise
 
     def concat_all(self, output_name: str = "full_video.mp4") -> str:
         """Concatenate all generated clips into one final video.

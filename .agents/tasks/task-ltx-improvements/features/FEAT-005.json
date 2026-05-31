@@ -1,0 +1,28 @@
+{
+  "id": "FEAT-005",
+  "type": "feat",
+  "description": "Error Handling & Robustness improvements: Checkpointing/resume, per-clip timeout, prompt quality validation, progress tracking with ETA, and CLIP fp4/fp8 fallback.",
+  "status": "in_progress",
+  "steps": [
+    "1. Checkpointing/resume: Add a Checkpoint class that saves/loads checkpoint.json after each successful beat. Fields: completed_beats (list of int), clip_paths (dict mapping beat_idx to path), bible_state (serialized CharacterBible), scene_history (list), current_seed (int), config_hash (hash of relevant config for invalidation). In InfiniteFlowEngine, add checkpoint_dir param (default: output_dir). At start of run(), check for existing checkpoint and resume from last completed beat. After each successful beat in _generate_single_segment(), save checkpoint.",
+    "2. Per-clip timeout: Add a clip_timeout_sec: int = 600 param (default 10 min) to generate_clip() and InfiniteFlowEngine. Wrap the generate_clip() call in _generate_single_segment() with a threading-based timeout (using concurrent.futures.ThreadPoolExecutor with timeout). On timeout, raise a ClipTimeoutError (custom exception). Handle it in the retry logic by reducing frames and retrying.",
+    "3. Prompt quality validation: Add a _validate_prompt(prompt: str, raw_beat: str) -> tuple[bool, str] function that checks: (a) minimum word count >= 30, (b) no excessive repetition (no word repeated > 5 times in sequence), (c) prompt is substantially different from raw beat (at least 2x longer). If validation fails, return (False, reason). In _process_beat(), after EasyPromptEngine.generate(), validate the result. If it fails, log warning and fall back to using the raw beat directly (with _build_neg applied).",
+    "4. Progress tracking: Add a ProgressTracker class that writes a progress.json file with: total_beats, completed_beats, current_beat, elapsed_seconds, avg_seconds_per_beat, estimated_remaining_seconds, estimated_completion_time (ISO format), status ('running'/'complete'/'error'). Instantiate in InfiniteFlowEngine.run() and update after each beat. Write to output_dir/progress.json.",
+    "5. CLIP fp4/fp8 fallback: The reference file LTX2_InfiniteFlow_12Scene.py already has a try/except pattern for this. Verify that the current LTX.PY's _load_clip_encode() (from FEAT-001) has the fallback. It should try loading _M_CLIP1 (fp4) first, catch any exception, then try the fp8 variant 'gemma_3_12B_it_fp8_scaled.safetensors'. If FEAT-001 already includes this pattern from the existing code, just ensure it is properly integrated into the new _load_clip_encode() sub-function."
+  ],
+  "acceptance_criteria": [
+    "AST parse passes",
+    "Checkpoint class exists with save() and load() methods",
+    "ClipTimeoutError custom exception is defined",
+    "generate_clip() and InfiniteFlowEngine have clip_timeout_sec param",
+    "_validate_prompt() function exists with word count and repetition checks",
+    "ProgressTracker class exists with update() and to_json() methods",
+    "CLIP fp4/fp8 fallback is in _load_clip_encode()"
+  ],
+  "verification": [
+    "python -c \"import ast; ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); print('PASS')\"",
+    "python -c \"import ast; tree=ast.parse(open('/projects/sandbox/ltx2/LTX.PY').read()); names=[n.name for n in ast.walk(tree) if isinstance(n, (ast.ClassDef, ast.FunctionDef))]; assert 'Checkpoint' in names; assert 'ClipTimeoutError' in names or 'ProgressTracker' in names; assert '_validate_prompt' in names; assert 'ProgressTracker' in names; print('Error handling features present')\""
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}
